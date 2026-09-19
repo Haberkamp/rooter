@@ -3,7 +3,7 @@ mod nav_link;
 mod router;
 
 pub use config::{
-    GuardResult, PageFactory, ParamConstraint, ParamError, RouteContext, RouterConfig,
+    GuardFactory, GuardResult, PageFactory, ParamConstraint, ParamError, RouteContext, RouterConfig,
 };
 #[doc(hidden)]
 pub use config::{WithAppContext, WithRoute, WithRouteContext, WithoutContext};

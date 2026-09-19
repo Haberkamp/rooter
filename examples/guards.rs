@@ -3,7 +3,7 @@ use gpui::{
     App, AppContext, Application, BorrowAppContext, Context, Entity, Global, Window, WindowOptions,
     div,
 };
-use rooter::{GuardResult, NavLink, Router, RouterConfig};
+use rooter::{GuardResult, NavLink, RouteContext, Router, RouterConfig};
 
 #[derive(Default)]
 struct AuthState {
@@ -20,6 +20,14 @@ fn authenticated(_window: &mut Window, cx: &mut App) -> GuardResult {
     }
 }
 
+fn owns_account(route: RouteContext) -> GuardResult {
+    if route.param("id") == Some("42") {
+        GuardResult::Allow
+    } else {
+        GuardResult::Redirect("/account".to_owned())
+    }
+}
+
 fn routes() -> RouterConfig {
     RouterConfig::new()
         .route("/", || {
@@ -32,6 +40,11 @@ fn routes() -> RouterConfig {
             div().child("You are logged in, so the account guard allowed this page.")
         })
         .guard(authenticated)
+        .route("/users/{id}", || {
+            div().child("This page is only allowed for user 42.")
+        })
+        .guard(authenticated)
+        .guard(owns_account)
 }
 
 struct AppView {
@@ -72,6 +85,16 @@ impl Render for AppView {
                         NavLink::to("/account")
                             .when_active(None, |link| link.underline())
                             .child("Protected account"),
+                    )
+                    .child(
+                        NavLink::to("/users/42")
+                            .when_active(None, |link| link.underline())
+                            .child("User 42"),
+                    )
+                    .child(
+                        NavLink::to("/users/7")
+                            .when_active(None, |link| link.underline())
+                            .child("User 7"),
                     ),
             )
             .child(

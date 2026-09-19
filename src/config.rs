@@ -2,7 +2,7 @@ use gpui::{AnyElement, App, IntoElement, Window};
 use std::{ops::Range, rc::Rc};
 
 pub(crate) type RouteFactory = Box<dyn Fn(RouteContext, &mut Window, &mut App) -> AnyElement>;
-pub(crate) type RouteGuard = Rc<dyn Fn(&mut Window, &mut App) -> GuardResult>;
+pub(crate) type RouteGuard = Rc<dyn Fn(RouteContext, &mut Window, &mut App) -> GuardResult>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GuardResult {
@@ -102,6 +102,47 @@ where
 {
     fn render(&self, route: RouteContext, window: &mut Window, cx: &mut App) -> AnyElement {
         self(route, window, cx).into_any_element()
+    }
+}
+
+pub trait GuardFactory<Kind>: 'static {
+    #[doc(hidden)]
+    fn run(&self, route: RouteContext, window: &mut Window, cx: &mut App) -> GuardResult;
+}
+
+impl<F> GuardFactory<WithoutContext> for F
+where
+    F: Fn() -> GuardResult + 'static,
+{
+    fn run(&self, _route: RouteContext, _window: &mut Window, _cx: &mut App) -> GuardResult {
+        self()
+    }
+}
+
+impl<F> GuardFactory<WithAppContext> for F
+where
+    F: Fn(&mut Window, &mut App) -> GuardResult + 'static,
+{
+    fn run(&self, _route: RouteContext, window: &mut Window, cx: &mut App) -> GuardResult {
+        self(window, cx)
+    }
+}
+
+impl<F> GuardFactory<WithRoute> for F
+where
+    F: Fn(RouteContext) -> GuardResult + 'static,
+{
+    fn run(&self, route: RouteContext, _window: &mut Window, _cx: &mut App) -> GuardResult {
+        self(route)
+    }
+}
+
+impl<F> GuardFactory<WithRouteContext> for F
+where
+    F: Fn(RouteContext, &mut Window, &mut App) -> GuardResult + 'static,
+{
+    fn run(&self, route: RouteContext, window: &mut Window, cx: &mut App) -> GuardResult {
+        self(route, window, cx)
     }
 }
 
@@ -293,8 +334,11 @@ impl RouterConfig {
         self
     }
 
-    pub fn guard(mut self, guard: impl Fn(&mut Window, &mut App) -> GuardResult + 'static) -> Self {
-        let guard: RouteGuard = Rc::new(guard);
+    pub fn guard<G, Kind>(mut self, guard: G) -> Self
+    where
+        G: GuardFactory<Kind>,
+    {
+        let guard: RouteGuard = Rc::new(move |route, window, cx| guard.run(route, window, cx));
         match self.last_registration.as_ref() {
             Some(LastRegistration::Route(index)) => {
                 self.routes[*index].guards.push(guard);
@@ -953,7 +997,7 @@ mod tests {
     fn attaches_a_guard_to_the_previous_route() {
         let config = RouterConfig::new()
             .route("/", || "home")
-            .guard(|_, _| GuardResult::Allow)
+            .guard(|| GuardResult::Allow)
             .route("/public", || "public");
 
         assert_eq!(config.routes[0].guards.len(), 1);
@@ -969,7 +1013,7 @@ mod tests {
                     .route("users", || "users")
                     .group("settings", |routes| routes.index(|| "settings"))
             })
-            .guard(|_, _| GuardResult::Allow)
+            .guard(|| GuardResult::Allow)
             .route("/login", || "login");
 
         assert_eq!(config.routes[0].guards.len(), 1);
@@ -979,9 +1023,41 @@ mod tests {
     }
 
     #[test]
+    fn accepts_route_aware_guards() {
+        fn owns_user(route: super::RouteContext) -> GuardResult {
+            if route.param("id") == Some("42") {
+                GuardResult::Allow
+            } else {
+                GuardResult::Deny
+            }
+        }
+
+        fn inspects_query(
+            route: super::RouteContext,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::App,
+        ) -> GuardResult {
+            if route.query("tab") == Some("billing") {
+                GuardResult::Allow
+            } else {
+                GuardResult::Redirect("/login".to_owned())
+            }
+        }
+
+        let config = RouterConfig::new()
+            .route("/users/{id}", || "user")
+            .guard(owns_user)
+            .route("/account", || "account")
+            .guard(inspects_query);
+
+        assert_eq!(config.routes[0].guards.len(), 1);
+        assert_eq!(config.routes[1].guards.len(), 1);
+    }
+
+    #[test]
     #[should_panic(expected = "a guard must follow a route or group")]
     fn rejects_a_guard_without_a_previous_route_or_group() {
-        let _ = RouterConfig::new().guard(|_, _| GuardResult::Allow);
+        let _ = RouterConfig::new().guard(|| GuardResult::Allow);
     }
 
     #[test]
