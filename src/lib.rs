@@ -5,7 +5,7 @@ mod router;
 
 pub use config::{
     GuardFactory, GuardResult, PageFactory, ParamConstraint, ParamError, Redirect, RouteContext,
-    RouterConfig,
+    RouterConfig, UrlError,
 };
 #[doc(hidden)]
 pub use config::{WithAppContext, WithRoute, WithRouteContext, WithoutContext};

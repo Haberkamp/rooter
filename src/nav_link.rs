@@ -80,7 +80,9 @@ impl ParentElement for NavLink {
 
 impl RenderOnce for NavLink {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let to = resolve_target(&self.to, window, cx);
+        let Some(to) = resolve_target(&self.to, window, cx) else {
+            return div().children(self.children).into_any_element();
+        };
         let active = Router::window_location(window, cx).is_some_and(|location| {
             location_matches(location.as_ref(), to.as_ref(), self.match_mode)
         });
@@ -93,16 +95,16 @@ impl RenderOnce for NavLink {
         if active && let Some(when_active) = self.when_active {
             link = when_active(link);
         }
-        link
+        link.into_any_element()
     }
 }
 
-fn resolve_target(target: &NavTarget, window: &Window, cx: &App) -> SharedString {
+fn resolve_target(target: &NavTarget, window: &Window, cx: &App) -> Option<SharedString> {
     match target {
-        NavTarget::Path(path) => path.clone(),
+        NavTarget::Path(path) => Some(path.clone()),
         NavTarget::Named { name, params } => Router::window_url(window, cx, name, params)
-            .unwrap_or_else(|| panic!("unknown route name `{name}`"))
-            .into(),
+            .and_then(Result::ok)
+            .map(Into::into),
     }
 }
 
@@ -296,7 +298,9 @@ mod tests {
         let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
 
         router.update(&mut visual, |router, cx| {
-            let path = router.url("users.show", [("id", "42"), ("tab", "profile")]);
+            let path = router
+                .url("users.show", [("id", "42"), ("tab", "profile")])
+                .unwrap();
             router.navigate(path, cx);
         });
         visual.draw(point(px(0.), px(0.)), size(px(200.), px(40.)), |_, _| {
@@ -317,5 +321,18 @@ mod tests {
             router.read_with(&visual, |router, _| router.location().to_owned()),
             "/users/42?tab=profile"
         );
+    }
+
+    #[gpui::test]
+    async fn unknown_named_links_do_not_panic(cx: &mut TestAppContext) {
+        let config = RouterConfig::new().route("/", || "home");
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        visual.draw(point(px(0.), px(0.)), size(px(200.), px(40.)), |_, _| {
+            div().child(NavLink::named("missing").child("Broken"))
+        });
     }
 }
