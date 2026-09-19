@@ -53,6 +53,13 @@ impl Router {
         router.update(cx, |router, cx| router.navigate(path, cx));
         true
     }
+
+    pub(crate) fn window_location(window: &Window, cx: &App) -> Option<SharedString> {
+        cx.try_global::<WindowRouters>()
+            .and_then(|routers| routers.0.get(&window.window_handle().window_id()))
+            .and_then(WeakEntity::upgrade)
+            .map(|router| router.read(cx).location.clone())
+    }
 }
 
 impl Render for Router {

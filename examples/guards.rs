@@ -63,8 +63,16 @@ impl Render for AppView {
                 div()
                     .flex()
                     .gap_4()
-                    .child(NavLink::to("/").child("Home"))
-                    .child(NavLink::to("/account").child("Protected account")),
+                    .child(
+                        NavLink::to("/")
+                            .when_active(None, |link| link.underline())
+                            .child("Home"),
+                    )
+                    .child(
+                        NavLink::to("/account")
+                            .when_active(None, |link| link.underline())
+                            .child("Protected account"),
+                    ),
             )
             .child(
                 div()

@@ -7,5 +7,5 @@ pub use config::{
 };
 #[doc(hidden)]
 pub use config::{WithAppContext, WithRoute, WithRouteContext, WithoutContext};
-pub use nav_link::NavLink;
+pub use nav_link::{ActiveMatch, NavLink};
 pub use router::Router;

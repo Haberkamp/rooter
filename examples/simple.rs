@@ -62,8 +62,16 @@ impl Render for HelloWorld {
                 div()
                     .flex()
                     .gap_4()
-                    .child(NavLink::to("/").child(div().child("Home")))
-                    .child(NavLink::to("/about").child(div().child("About"))),
+                    .child(
+                        NavLink::to("/")
+                            .when_active(None, |link| link.underline())
+                            .child(div().child("Home")),
+                    )
+                    .child(
+                        NavLink::to("/about")
+                            .when_active(None, |link| link.underline())
+                            .child(div().child("About")),
+                    ),
             )
             .child(self.router.clone())
     }

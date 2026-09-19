@@ -31,8 +31,16 @@ impl Render for AppView {
                 div()
                     .flex()
                     .gap_4()
-                    .child(NavLink::to("/").child("Home"))
-                    .child(NavLink::to("/about").child("About")),
+                    .child(
+                        NavLink::to("/")
+                            .when_active(None, |link| link.underline())
+                            .child("Home"),
+                    )
+                    .child(
+                        NavLink::to("/about")
+                            .when_active(None, |link| link.underline())
+                            .child("About"),
+                    ),
             )
             .child(self.router.clone())
     }
