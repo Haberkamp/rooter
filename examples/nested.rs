@@ -15,9 +15,7 @@ fn routes() -> RouterConfig {
                     routes
                         .index(|| page("This nested index matches /dashboard/users."))
                         .route("{id}", user_page)
-                        .route("{*rest}", || {
-                            page("This catch-all is scoped to /dashboard/users.")
-                        })
+                        .route("{*rest}", missing_user_page)
                 })
         })
         .route("/{*rest}", || page("This is the application catch-all."))
@@ -31,6 +29,13 @@ fn user_page(route: RouteContext) -> impl IntoElement {
     page(format!(
         "This dynamic route matched user id {}.",
         route.param("id").unwrap()
+    ))
+}
+
+fn missing_user_page(route: RouteContext) -> impl IntoElement {
+    page(format!(
+        "No user route matched the remaining path: {}.",
+        route.param("rest").unwrap()
     ))
 }
 
