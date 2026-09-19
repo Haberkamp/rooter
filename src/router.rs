@@ -67,7 +67,7 @@ impl Render for Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{App, ParentElement, TestAppContext, div, point, px, size};
+    use gpui::{ParentElement, TestAppContext, div, point, px, size};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -85,9 +85,9 @@ mod tests {
 
     fn config() -> RouterConfig {
         RouterConfig::new()
-            .route("/", |_, _| "home")
-            .route("/about", |_, _| "about")
-            .route("/{*rest}", |_, _| "not found")
+            .route("/", || "home")
+            .route("/about", || "about")
+            .route("/{*rest}", || "not found")
     }
 
     #[test]
@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn returns_none_without_a_matching_route() {
-        let config = RouterConfig::new().route("/", |_, _| "home");
+        let config = RouterConfig::new().route("/", || "home");
         assert_eq!(config.match_index("/missing"), None);
     }
 
@@ -181,11 +181,11 @@ mod tests {
         let home_factory = home.clone();
         let about_factory = about.clone();
         let config = RouterConfig::new()
-            .route("/", move |_: &mut Window, _: &mut App| {
+            .route("/", move || {
                 home_factory.fetch_add(1, Ordering::SeqCst);
                 "home"
             })
-            .route("/about", move |_: &mut Window, _: &mut App| {
+            .route("/about", move || {
                 about_factory.fetch_add(1, Ordering::SeqCst);
                 "about"
             });
@@ -211,11 +211,11 @@ mod tests {
         let settings_factory = settings.clone();
         let config = RouterConfig::new().group("dashboard", |routes| {
             routes
-                .index(move |_: &mut Window, _: &mut App| {
+                .index(move || {
                     dashboard_factory.fetch_add(1, Ordering::SeqCst);
                     "dashboard"
                 })
-                .route("settings", move |_: &mut Window, _: &mut App| {
+                .route("settings", move || {
                     settings_factory.fetch_add(1, Ordering::SeqCst);
                     "settings"
                 })

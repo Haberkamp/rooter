@@ -2,6 +2,41 @@ use gpui::{AnyElement, App, IntoElement, Window};
 
 pub(crate) type RouteFactory = Box<dyn Fn(&mut Window, &mut App) -> AnyElement>;
 
+pub trait PageFactory: 'static {
+    #[doc(hidden)]
+    fn render(&self, window: &mut Window, cx: &mut App) -> AnyElement;
+}
+
+impl<F, E> PageFactory for F
+where
+    F: Fn() -> E + 'static,
+    E: IntoElement,
+{
+    fn render(&self, _window: &mut Window, _cx: &mut App) -> AnyElement {
+        self().into_any_element()
+    }
+}
+
+pub struct ContextPageFactory<F>(F);
+
+pub fn with_context<F, E>(factory: F) -> ContextPageFactory<F>
+where
+    F: Fn(&mut Window, &mut App) -> E + 'static,
+    E: IntoElement,
+{
+    ContextPageFactory(factory)
+}
+
+impl<F, E> PageFactory for ContextPageFactory<F>
+where
+    F: Fn(&mut Window, &mut App) -> E + 'static,
+    E: IntoElement,
+{
+    fn render(&self, window: &mut Window, cx: &mut App) -> AnyElement {
+        (self.0)(window, cx).into_any_element()
+    }
+}
+
 pub(crate) struct RouteEntry {
     pub(crate) path: String,
     pub(crate) factory: RouteFactory,
@@ -36,14 +71,7 @@ impl RouterConfig {
         }
     }
 
-    pub fn route<E>(
-        mut self,
-        path: impl Into<String>,
-        factory: impl Fn(&mut Window, &mut App) -> E + 'static,
-    ) -> Self
-    where
-        E: IntoElement,
-    {
+    pub fn route(mut self, path: impl Into<String>, factory: impl PageFactory) -> Self {
         let original_path = path.into();
         if self.is_group && original_path.starts_with('/') {
             panic!(
@@ -59,15 +87,12 @@ impl RouterConfig {
         self.insert(
             path,
             original_path,
-            Box::new(move |window, cx| factory(window, cx).into_any_element()),
+            Box::new(move |window, cx| factory.render(window, cx)),
         );
         self
     }
 
-    pub fn index<E>(mut self, factory: impl Fn(&mut Window, &mut App) -> E + 'static) -> Self
-    where
-        E: IntoElement,
-    {
+    pub fn index(mut self, factory: impl PageFactory) -> Self {
         if !self.is_group {
             panic!(
                 "index routes can only be registered inside a group; use `route(\"/\", ...)` for the top-level route"
@@ -77,7 +102,7 @@ impl RouterConfig {
         self.insert(
             path.clone(),
             path,
-            Box::new(move |window, cx| factory(window, cx).into_any_element()),
+            Box::new(move |window, cx| factory.render(window, cx)),
         );
         self
     }
@@ -167,7 +192,19 @@ impl Default for RouterConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{RouterConfig, normalize_path};
+    use super::{RouterConfig, normalize_path, with_context};
+
+    #[test]
+    fn accepts_context_free_and_context_aware_page_factories() {
+        let config = RouterConfig::new()
+            .route("/", || "home")
+            .route("/settings", with_context(|_window, _cx| "settings"))
+            .group("/dashboard", |routes| routes.index(|| "dashboard"));
+
+        assert_eq!(config.matched_path("/"), Some("/"));
+        assert_eq!(config.matched_path("/settings"), Some("/settings"));
+        assert_eq!(config.matched_path("/dashboard"), Some("/dashboard"));
+    }
 
     #[test]
     fn normalizes_route_paths() {
@@ -193,26 +230,26 @@ mod tests {
     )]
     fn rejects_duplicate_normalized_routes() {
         let _ = RouterConfig::new()
-            .route("about", |_, _| "first")
-            .route("/about/", |_, _| "second");
+            .route("about", || "first")
+            .route("/about/", || "second");
     }
 
     #[test]
     fn flattens_recursive_groups_and_index_routes() {
         let config = RouterConfig::new()
-            .route("/", |_, _| "home")
+            .route("/", || "home")
             .group("dashboard", |routes| {
                 routes
-                    .index(|_, _| "dashboard")
-                    .route("settings", |_, _| "settings")
+                    .index(|| "dashboard")
+                    .route("settings", || "settings")
                     .group("users", |routes| {
                         routes
-                            .index(|_, _| "users")
-                            .route("{id}", |_, _| "user")
-                            .route("{*rest}", |_, _| "users not found")
+                            .index(|| "users")
+                            .route("{id}", || "user")
+                            .route("{*rest}", || "users not found")
                     })
             })
-            .route("{*rest}", |_, _| "not found");
+            .route("{*rest}", || "not found");
 
         assert_eq!(config.matched_path("/"), Some("/"));
         assert_eq!(config.matched_path("/dashboard"), Some("/dashboard"));
@@ -241,7 +278,7 @@ mod tests {
     )]
     fn rejects_absolute_routes_inside_groups() {
         let _ = RouterConfig::new().group("dashboard", |routes| {
-            routes.route("/settings", |_, _| "settings")
+            routes.route("/settings", || "settings")
         });
     }
 
@@ -251,8 +288,8 @@ mod tests {
     )]
     fn rejects_group_index_collisions() {
         let _ = RouterConfig::new()
-            .route("dashboard", |_, _| "first")
-            .group("dashboard", |routes| routes.index(|_, _| "second"));
+            .route("dashboard", || "first")
+            .group("dashboard", |routes| routes.index(|| "second"));
     }
 
     #[test]
@@ -260,14 +297,14 @@ mod tests {
         expected = "index routes can only be registered inside a group; use `route(\"/\", ...)` for the top-level route"
     )]
     fn rejects_top_level_index_routes() {
-        let _ = RouterConfig::new().index(|_, _| "home");
+        let _ = RouterConfig::new().index(|| "home");
     }
 
     #[test]
     fn preserves_declaration_order_for_non_fallback_routes() {
         let config = RouterConfig::new()
-            .route("/users/{id}", |_, _| "dynamic")
-            .route("/users/new", |_, _| "static");
+            .route("/users/{id}", || "dynamic")
+            .route("/users/new", || "static");
 
         assert_eq!(config.matched_path("/users/new"), Some("/users/{id}"));
     }
@@ -275,8 +312,8 @@ mod tests {
     #[test]
     fn defers_catch_all_routes_until_normal_routes_fail() {
         let config = RouterConfig::new()
-            .route("/{*rest}", |_, _| "fallback")
-            .route("/users/{id}", |_, _| "user");
+            .route("/{*rest}", || "fallback")
+            .route("/users/{id}", || "user");
 
         assert_eq!(config.matched_path("/users/42"), Some("/users/{id}"));
         assert_eq!(config.matched_path("/missing"), Some("/{*rest}"));

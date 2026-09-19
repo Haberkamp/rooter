@@ -4,27 +4,25 @@ use rooter::{NavLink, Router, RouterConfig};
 
 fn routes() -> RouterConfig {
     RouterConfig::new()
-        .route("/", |_, _| page("This page is outside every group."))
+        .route("/", || page("This page is outside every group."))
         .group("/dashboard", |routes| {
             routes
-                .index(|_, _| page("This index page matches the /dashboard group itself."))
-                .route("settings", |_, _| {
+                .index(|| page("This index page matches the /dashboard group itself."))
+                .route("settings", || {
                     page("This route expands to /dashboard/settings.")
                 })
                 .group("users", |routes| {
                     routes
-                        .index(|_, _| page("This nested index matches /dashboard/users."))
-                        .route("{id}", |_, _| {
+                        .index(|| page("This nested index matches /dashboard/users."))
+                        .route("{id}", || {
                             page("This dynamic route matches a single user id.")
                         })
-                        .route("{*rest}", |_, _| {
+                        .route("{*rest}", || {
                             page("This catch-all is scoped to /dashboard/users.")
                         })
                 })
         })
-        .route("/{*rest}", |_, _| {
-            page("This is the application catch-all.")
-        })
+        .route("/{*rest}", || page("This is the application catch-all."))
 }
 
 fn page(body: &'static str) -> impl IntoElement {
