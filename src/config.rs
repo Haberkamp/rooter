@@ -34,6 +34,23 @@ impl From<String> for ParamConstraint {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum ParamError<E> {
+    Missing(String),
+    Parse(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for ParamError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing(name) => write!(formatter, "missing route parameter `{name}`"),
+            Self::Parse(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for ParamError<E> {}
+
 #[doc(hidden)]
 pub struct WithoutContext;
 #[doc(hidden)]
@@ -104,6 +121,17 @@ impl RouteContext {
             .iter()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_str())
+    }
+
+    pub fn param_as<T: std::str::FromStr>(&self, name: &str) -> Result<T, ParamError<T::Err>> {
+        self.param(name)
+            .ok_or_else(|| ParamError::Missing(name.to_owned()))?
+            .parse()
+            .map_err(ParamError::Parse)
+    }
+
+    pub fn optional_param_as<T: std::str::FromStr>(&self, name: &str) -> Result<Option<T>, T::Err> {
+        self.param(name).map(str::parse).transpose()
     }
 }
 
@@ -498,7 +526,38 @@ impl Default for RouterConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{GuardResult, ParamConstraint, RouterConfig, normalize_path};
+    use super::{GuardResult, ParamConstraint, ParamError, RouterConfig, normalize_path};
+
+    #[test]
+    fn parses_typed_route_parameters() {
+        let config = RouterConfig::new().route("/users/{id}", || "user");
+        let matched = config.match_route("/users/42").unwrap();
+
+        assert_eq!(matched.context.param_as::<u64>("id"), Ok(42));
+    }
+
+    #[test]
+    fn distinguishes_required_and_optional_missing_typed_parameters() {
+        let config = RouterConfig::new().route("/users/{id?}", || "users");
+        let matched = config.match_route("/users").unwrap();
+
+        assert_eq!(
+            matched.context.param_as::<u64>("id"),
+            Err(ParamError::Missing("id".to_owned()))
+        );
+        assert_eq!(matched.context.optional_param_as::<u64>("id"), Ok(None));
+    }
+
+    #[test]
+    fn returns_the_parse_error_for_an_invalid_typed_parameter() {
+        let config = RouterConfig::new().route("/users/{id}", || "user");
+        let matched = config.match_route("/users/not-a-number").unwrap();
+
+        assert!(matches!(
+            matched.context.param_as::<u64>("id"),
+            Err(ParamError::Parse(_))
+        ));
+    }
 
     #[test]
     fn matches_optional_trailing_parameters_with_or_without_a_value() {

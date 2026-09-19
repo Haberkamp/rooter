@@ -254,6 +254,28 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn page_factories_can_parse_typed_parameters(cx: &mut TestAppContext) {
+        let captured_id = Arc::new(Mutex::new(None));
+        let page_id = captured_id.clone();
+        let config = RouterConfig::new().route("/users/{id}", move |route: crate::RouteContext| {
+            *page_id.lock().unwrap() = Some(route.param_as::<u64>("id").unwrap());
+            "user"
+        });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        router.update(&mut visual, |router, cx| router.navigate("/users/42", cx));
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router
+        });
+
+        assert_eq!(*captured_id.lock().unwrap(), Some(42));
+    }
+
+    #[gpui::test]
     async fn catch_all_parameters_are_passed_to_the_page_factory(cx: &mut TestAppContext) {
         let captured_path = Arc::new(Mutex::new(None));
         let page_path = captured_path.clone();
