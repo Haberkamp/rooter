@@ -4,9 +4,9 @@ use rooter::{NavLink, Router, RouterConfig};
 
 fn routes() -> RouterConfig {
     RouterConfig::new()
-        .route("/", |_, _| home())
-        .route("/about", |_, _| about())
-        .route("/{*rest}", |_, _| not_found())
+        .route("/", home)
+        .route("/about", about)
+        .route("/{*rest}", not_found)
 }
 
 fn home() -> impl IntoElement {
