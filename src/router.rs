@@ -1,4 +1,4 @@
-use crate::{RouterConfig, config::normalize_path};
+use crate::{GuardResult, RouterConfig, config::normalize_path};
 use gpui::{
     App, AppContext, Context, Empty, Entity, Global, IntoElement, Render, SharedString, WeakEntity,
     Window, WindowId,
@@ -57,10 +57,33 @@ impl Router {
 
 impl Render for Router {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(index) = self.config.match_index(&self.location) else {
-            return Empty.into_any_element();
-        };
-        (self.config.routes[index].factory)(window, cx).into_any_element()
+        let mut redirects_remaining = self.config.routes.len();
+
+        loop {
+            let Some(index) = self.config.match_index(&self.location) else {
+                return Empty.into_any_element();
+            };
+            let guard_result = self.config.routes[index]
+                .guards
+                .iter()
+                .map(|guard| guard(window, cx))
+                .find(|result| !matches!(result, GuardResult::Allow));
+            match guard_result {
+                Some(GuardResult::Deny) => return Empty.into_any_element(),
+                Some(GuardResult::Redirect(path)) => {
+                    let path = normalize_path(&path);
+                    if self.location.as_ref() == path || redirects_remaining == 0 {
+                        return Empty.into_any_element();
+                    }
+                    redirects_remaining -= 1;
+                    self.location = path.into();
+                    cx.notify();
+                }
+                Some(GuardResult::Allow) | None => {
+                    return (self.config.routes[index].factory)(window, cx).into_any_element();
+                }
+            }
+        }
     }
 }
 
@@ -201,6 +224,59 @@ mod tests {
 
         assert!(home.load(Ordering::SeqCst) > 0);
         assert_eq!(about.load(Ordering::SeqCst), 0);
+    }
+
+    #[gpui::test]
+    async fn denied_routes_do_not_render_the_page_factory(cx: &mut TestAppContext) {
+        let renders = Arc::new(AtomicUsize::new(0));
+        let page_renders = renders.clone();
+        let config = RouterConfig::new()
+            .route("/", move || {
+                page_renders.fetch_add(1, Ordering::SeqCst);
+                "private"
+            })
+            .guard(|_, _| crate::GuardResult::Deny);
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router
+        });
+
+        assert_eq!(renders.load(Ordering::SeqCst), 0);
+    }
+
+    #[gpui::test]
+    async fn redirecting_guards_change_the_current_location(cx: &mut TestAppContext) {
+        let login_renders = Arc::new(AtomicUsize::new(0));
+        let login_page_renders = login_renders.clone();
+        let config = RouterConfig::new()
+            .route("/", || "private")
+            .guard(|_, _| crate::GuardResult::Redirect("/login".to_owned()))
+            .route("/login", move || {
+                login_page_renders.fetch_add(1, Ordering::SeqCst);
+                "login"
+            });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        visual.update(|window, cx| {
+            router.update(cx, |router, cx| {
+                router.render(window, cx).into_any_element()
+            });
+        });
+
+        assert_eq!(
+            router.read_with(&visual, |router, _| router.location().to_owned()),
+            "/login"
+        );
+        assert!(login_renders.load(Ordering::SeqCst) > 0);
     }
 
     #[gpui::test]
