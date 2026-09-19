@@ -1,14 +1,17 @@
 use gpui::prelude::*;
-use gpui::{App, Application, Context, Entity, Window, WindowOptions, div};
+use gpui::{
+    App, Application, Context, Entity, InteractiveElement, StatefulInteractiveElement, Window,
+    WindowOptions, div,
+};
 use rooter::{ActiveMatch, NavLink, Outlet, RouteContext, Router, RouterConfig};
 
-fn routes() -> RouterConfig {
+fn routes(sidebar: Entity<Sidebar>) -> RouterConfig {
     RouterConfig::new()
         .layout(app_shell)
         .route("/", home)
         .group("/dashboard", |routes| {
             routes
-                .layout(dashboard)
+                .layout(move || dashboard(sidebar.clone()))
                 .index(dashboard_home)
                 .route("settings", settings)
                 .group("users", |routes| {
@@ -59,18 +62,11 @@ fn app_shell() -> impl IntoElement {
         .child(Outlet::new())
 }
 
-fn dashboard() -> impl IntoElement {
+fn dashboard(sidebar: Entity<Sidebar>) -> impl IntoElement {
     div()
         .flex()
         .gap_4()
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child("Dashboard sidebar")
-                .child("This layout wraps every /dashboard route."),
-        )
+        .child(sidebar)
         .child(div().flex().flex_col().gap_2().child(Outlet::new()))
 }
 
@@ -84,7 +80,9 @@ fn users_chrome(route: RouteContext) -> impl IntoElement {
 }
 
 fn home() -> impl IntoElement {
-    div().child("Home sits in the app shell only. Open Dashboard to see nested layouts.")
+    div().child(
+        "Home sits in the app shell only. Open Dashboard, collapse the sidebar or add a note, then leave and come back.",
+    )
 }
 
 fn dashboard_home() -> impl IntoElement {
@@ -108,14 +106,60 @@ fn not_found() -> impl IntoElement {
     div().child("This catch-all still uses the app shell.")
 }
 
+struct Sidebar {
+    collapsed: bool,
+    notes: usize,
+}
+
+impl Render for Sidebar {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let collapsed = self.collapsed;
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(if collapsed {
+                "Sidebar (collapsed)"
+            } else {
+                "Dashboard sidebar"
+            })
+            .child(format!("Remembered notes: {}", self.notes))
+            .child(
+                div()
+                    .id("toggle-sidebar")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.collapsed = !this.collapsed;
+                        cx.notify();
+                    }))
+                    .child(if collapsed { "Expand" } else { "Collapse" }),
+            )
+            .child(
+                div()
+                    .id("add-note")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.notes += 1;
+                        cx.notify();
+                    }))
+                    .child("Add a note"),
+            )
+            .when(!collapsed, |this| {
+                this.child("This layout wraps every /dashboard route. Its state lives on AppView, not in the layout factory.")
+            })
+    }
+}
+
 struct AppView {
     router: Entity<Router>,
 }
 
 impl AppView {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let sidebar = cx.new(|_| Sidebar {
+            collapsed: false,
+            notes: 0,
+        });
         Self {
-            router: Router::attach(window, cx, routes()),
+            router: Router::attach(window, cx, routes(sidebar)),
         }
     }
 }
