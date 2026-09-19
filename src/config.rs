@@ -1,7 +1,7 @@
 use gpui::{AnyElement, App, IntoElement, Window};
 use std::{ops::Range, rc::Rc};
 
-pub(crate) type RouteFactory = Box<dyn Fn(&mut Window, &mut App) -> AnyElement>;
+pub(crate) type RouteFactory = Box<dyn Fn(RouteContext, &mut Window, &mut App) -> AnyElement>;
 pub(crate) type RouteGuard = Rc<dyn Fn(&mut Window, &mut App) -> GuardResult>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -11,39 +11,82 @@ pub enum GuardResult {
     Redirect(String),
 }
 
-pub trait PageFactory: 'static {
+#[doc(hidden)]
+pub struct WithoutContext;
+#[doc(hidden)]
+pub struct WithAppContext;
+#[doc(hidden)]
+pub struct WithRoute;
+#[doc(hidden)]
+pub struct WithRouteContext;
+
+pub trait PageFactory<Kind>: 'static {
     #[doc(hidden)]
-    fn render(&self, window: &mut Window, cx: &mut App) -> AnyElement;
+    fn render(&self, route: RouteContext, window: &mut Window, cx: &mut App) -> AnyElement;
 }
 
-impl<F, E> PageFactory for F
+impl<F, E> PageFactory<WithoutContext> for F
 where
     F: Fn() -> E + 'static,
     E: IntoElement,
 {
-    fn render(&self, _window: &mut Window, _cx: &mut App) -> AnyElement {
+    fn render(&self, _route: RouteContext, _window: &mut Window, _cx: &mut App) -> AnyElement {
         self().into_any_element()
     }
 }
 
-pub struct ContextPageFactory<F>(F);
-
-pub fn with_context<F, E>(factory: F) -> ContextPageFactory<F>
+impl<F, E> PageFactory<WithAppContext> for F
 where
     F: Fn(&mut Window, &mut App) -> E + 'static,
     E: IntoElement,
 {
-    ContextPageFactory(factory)
+    fn render(&self, _route: RouteContext, window: &mut Window, cx: &mut App) -> AnyElement {
+        self(window, cx).into_any_element()
+    }
 }
 
-impl<F, E> PageFactory for ContextPageFactory<F>
+impl<F, E> PageFactory<WithRoute> for F
 where
-    F: Fn(&mut Window, &mut App) -> E + 'static,
+    F: Fn(RouteContext) -> E + 'static,
     E: IntoElement,
 {
-    fn render(&self, window: &mut Window, cx: &mut App) -> AnyElement {
-        (self.0)(window, cx).into_any_element()
+    fn render(&self, route: RouteContext, _window: &mut Window, _cx: &mut App) -> AnyElement {
+        self(route).into_any_element()
     }
+}
+
+impl<F, E> PageFactory<WithRouteContext> for F
+where
+    F: Fn(RouteContext, &mut Window, &mut App) -> E + 'static,
+    E: IntoElement,
+{
+    fn render(&self, route: RouteContext, window: &mut Window, cx: &mut App) -> AnyElement {
+        self(route, window, cx).into_any_element()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteContext {
+    path: String,
+    params: Vec<(String, String)>,
+}
+
+impl RouteContext {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn param(&self, name: &str) -> Option<&str> {
+        self.params
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+pub(crate) struct MatchedRoute {
+    pub(crate) index: usize,
+    pub(crate) context: RouteContext,
 }
 
 pub(crate) struct RouteEntry {
@@ -88,7 +131,10 @@ impl RouterConfig {
         }
     }
 
-    pub fn route(mut self, path: impl Into<String>, factory: impl PageFactory) -> Self {
+    pub fn route<F, Kind>(mut self, path: impl Into<String>, factory: F) -> Self
+    where
+        F: PageFactory<Kind>,
+    {
         let original_path = path.into();
         if self.is_group && original_path.starts_with('/') {
             panic!(
@@ -104,12 +150,15 @@ impl RouterConfig {
         self.insert(
             path,
             original_path,
-            Box::new(move |window, cx| factory.render(window, cx)),
+            Box::new(move |route, window, cx| factory.render(route, window, cx)),
         );
         self
     }
 
-    pub fn index(mut self, factory: impl PageFactory) -> Self {
+    pub fn index<F, Kind>(mut self, factory: F) -> Self
+    where
+        F: PageFactory<Kind>,
+    {
         if !self.is_group {
             panic!(
                 "index routes can only be registered inside a group; use `route(\"/\", ...)` for the top-level route"
@@ -119,7 +168,7 @@ impl RouterConfig {
         self.insert(
             path.clone(),
             path,
-            Box::new(move |window, cx| factory.render(window, cx)),
+            Box::new(move |route, window, cx| factory.render(route, window, cx)),
         );
         self
     }
@@ -206,20 +255,24 @@ impl RouterConfig {
         self.last_registration = Some(LastRegistration::Route(index));
     }
 
-    pub(crate) fn match_index(&self, path: &str) -> Option<usize> {
+    pub(crate) fn match_route(&self, path: &str) -> Option<MatchedRoute> {
         self.routes
             .iter()
             .enumerate()
             .filter(|(_, route)| !route.is_catch_all)
-            .find(|(_, route)| route.matcher.at(path).is_ok())
+            .find_map(|(index, route)| matched_route(index, route, path))
             .or_else(|| {
                 self.routes
                     .iter()
                     .enumerate()
                     .filter(|(_, route)| route.is_catch_all)
-                    .find(|(_, route)| route.matcher.at(path).is_ok())
+                    .find_map(|(index, route)| matched_route(index, route, path))
             })
-            .map(|(index, _)| index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn match_index(&self, path: &str) -> Option<usize> {
+        self.match_route(path).map(|matched| matched.index)
     }
 
     #[cfg(test)]
@@ -227,6 +280,22 @@ impl RouterConfig {
         self.match_index(path)
             .map(|index| self.routes[index].path.as_str())
     }
+}
+
+fn matched_route(index: usize, route: &RouteEntry, path: &str) -> Option<MatchedRoute> {
+    let matched = route.matcher.at(path).ok()?;
+    let params = matched
+        .params
+        .iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+    Some(MatchedRoute {
+        index,
+        context: RouteContext {
+            path: path.to_owned(),
+            params,
+        },
+    })
 }
 
 fn join_paths(prefix: &str, path: &str) -> String {
@@ -241,7 +310,44 @@ impl Default for RouterConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{GuardResult, RouterConfig, normalize_path, with_context};
+    use super::{GuardResult, RouterConfig, normalize_path};
+
+    #[test]
+    fn extracts_required_route_parameters() {
+        let config = RouterConfig::new().route("/users/{id}", || "user");
+
+        let matched = config.match_route("/users/42").unwrap();
+
+        assert_eq!(matched.index, 0);
+        assert_eq!(matched.context.path(), "/users/42");
+        assert_eq!(matched.context.param("id"), Some("42"));
+        assert_eq!(matched.context.param("missing"), None);
+    }
+
+    #[test]
+    fn accepts_route_aware_page_factories() {
+        fn user_page(route: super::RouteContext) -> String {
+            route.path().to_owned()
+        }
+
+        fn settings_page(
+            route: super::RouteContext,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::App,
+        ) -> String {
+            route.path().to_owned()
+        }
+
+        let config = RouterConfig::new()
+            .route("/users/{id}", user_page)
+            .route("/settings/{section}", settings_page);
+
+        assert_eq!(config.matched_path("/users/42"), Some("/users/{id}"));
+        assert_eq!(
+            config.matched_path("/settings/profile"),
+            Some("/settings/{section}")
+        );
+    }
 
     #[test]
     fn attaches_a_guard_to_the_previous_route() {
@@ -280,9 +386,13 @@ mod tests {
 
     #[test]
     fn accepts_context_free_and_context_aware_page_factories() {
+        fn settings(_window: &mut gpui::Window, _cx: &mut gpui::App) -> &'static str {
+            "settings"
+        }
+
         let config = RouterConfig::new()
             .route("/", || "home")
-            .route("/settings", with_context(|_window, _cx| "settings"))
+            .route("/settings", settings)
             .group("/dashboard", |routes| routes.index(|| "dashboard"));
 
         assert_eq!(config.matched_path("/"), Some("/"));
