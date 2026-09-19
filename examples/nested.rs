@@ -26,10 +26,8 @@ fn page(body: impl IntoElement) -> impl IntoElement {
 }
 
 fn user_page(route: RouteContext) -> impl IntoElement {
-    page(format!(
-        "This dynamic route matched user id {}.",
-        route.param("id").unwrap()
-    ))
+    let id = route.param_as::<u64>("id").unwrap();
+    page(format!("This dynamic route matched numeric user id {id}."))
 }
 
 fn missing_user_page(route: RouteContext) -> impl IntoElement {
