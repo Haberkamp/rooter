@@ -11,4 +11,4 @@ pub use config::{
 pub use config::{WithAppContext, WithRoute, WithRouteContext, WithoutContext};
 pub use nav_link::{ActiveMatch, NavLink};
 pub use outlet::Outlet;
-pub use router::Router;
+pub use router::{NavigationEvent, NavigationKind, Router};
