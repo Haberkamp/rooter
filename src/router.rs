@@ -1,4 +1,4 @@
-use crate::{GuardResult, RouterConfig, config::normalize_location};
+use crate::{GuardResult, RouterConfig, config::normalize_location, outlet::push_outlet};
 use gpui::{
     App, AppContext, Context, Empty, Entity, Global, IntoElement, Render, SharedString, WeakEntity,
     Window, WindowId,
@@ -171,12 +171,14 @@ impl Render for Router {
                     self.replace(path, cx);
                 }
                 Some(GuardResult::Allow) | None => {
-                    return (self.config.routes[matched.index].factory)(
-                        matched.context,
-                        window,
-                        cx,
-                    )
-                    .into_any_element();
+                    let route = &self.config.routes[matched.index];
+                    let context = matched.context;
+                    let mut current = (route.factory)(context.clone(), window, cx);
+                    for layout in route.layouts.iter().rev() {
+                        push_outlet(cx, current);
+                        current = layout(context.clone(), window, cx);
+                    }
+                    return current.into_any_element();
                 }
             }
         }
@@ -878,6 +880,76 @@ mod tests {
             router.clone()
         });
         assert!(settings.load(Ordering::SeqCst) > 0);
+    }
+
+    #[gpui::test]
+    async fn layouts_wrap_the_matched_page_through_an_outlet(cx: &mut TestAppContext) {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let layout_order = order.clone();
+        let page_order = order.clone();
+        let captured_id = Arc::new(Mutex::new(None));
+        let layout_id = captured_id.clone();
+        let config = RouterConfig::new().group("/users", |routes| {
+            routes
+                .layout(move |route: crate::RouteContext| {
+                    layout_order.lock().unwrap().push("layout");
+                    *layout_id.lock().unwrap() = route.param("id").map(str::to_owned);
+                    crate::Outlet::new()
+                })
+                .route("{id}", move || {
+                    page_order.lock().unwrap().push("page");
+                    "user"
+                })
+        });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        router.update(&mut visual, |router, cx| router.navigate("/users/42", cx));
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router
+        });
+
+        assert_eq!(&order.lock().unwrap()[..2], ["page", "layout"]);
+        assert_eq!(captured_id.lock().unwrap().as_deref(), Some("42"));
+    }
+
+    #[gpui::test]
+    async fn nested_layouts_render_from_the_inside_out(cx: &mut TestAppContext) {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let outer_order = order.clone();
+        let inner_order = order.clone();
+        let page_order = order.clone();
+        let config = RouterConfig::new()
+            .layout(move || {
+                outer_order.lock().unwrap().push("shell");
+                crate::Outlet::new()
+            })
+            .group("/dashboard", |routes| {
+                routes
+                    .layout(move || {
+                        inner_order.lock().unwrap().push("dashboard");
+                        crate::Outlet::new()
+                    })
+                    .index(move || {
+                        page_order.lock().unwrap().push("page");
+                        "dashboard"
+                    })
+            });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        router.update(&mut visual, |router, cx| router.navigate("/dashboard", cx));
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router
+        });
+
+        assert_eq!(&order.lock().unwrap()[..3], ["page", "dashboard", "shell"]);
     }
 
     fn router_for_window(

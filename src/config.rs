@@ -2,6 +2,7 @@ use gpui::{AnyElement, App, IntoElement, Window};
 use std::{ops::Range, rc::Rc};
 
 pub(crate) type RouteFactory = Box<dyn Fn(RouteContext, &mut Window, &mut App) -> AnyElement>;
+pub(crate) type LayoutFactory = Rc<dyn Fn(RouteContext, &mut Window, &mut App) -> AnyElement>;
 pub(crate) type RouteGuard = Rc<dyn Fn(RouteContext, &mut Window, &mut App) -> GuardResult>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -236,6 +237,7 @@ pub(crate) struct RouteEntry {
     pub(crate) path: String,
     pub(crate) factory: RouteFactory,
     pub(crate) guards: Vec<RouteGuard>,
+    pub(crate) layouts: Vec<LayoutFactory>,
     name: Option<String>,
     constraints: Vec<CompiledParamConstraint>,
     matchers: Vec<RouteMatcher>,
@@ -282,6 +284,8 @@ pub struct RouterConfig {
     prefix: String,
     is_group: bool,
     last_registration: Option<LastRegistration>,
+    layouts: Vec<LayoutFactory>,
+    layout_declared: bool,
 }
 
 enum LastRegistration {
@@ -296,6 +300,8 @@ impl RouterConfig {
             prefix: "/".to_owned(),
             is_group: false,
             last_registration: None,
+            layouts: Vec::new(),
+            layout_declared: false,
         }
     }
 
@@ -363,6 +369,8 @@ impl RouterConfig {
             prefix,
             is_group: true,
             last_registration: None,
+            layouts: self.layouts.clone(),
+            layout_declared: false,
         });
 
         let start = self.routes.len();
@@ -372,11 +380,29 @@ impl RouterConfig {
                 route.path,
                 route.factory,
                 route.guards,
+                route.layouts,
                 route.constraints,
                 route.name,
             );
         }
         self.last_registration = Some(LastRegistration::Group(start..self.routes.len()));
+        self
+    }
+
+    pub fn layout<F, Kind>(mut self, factory: F) -> Self
+    where
+        F: PageFactory<Kind>,
+    {
+        if self.layout_declared {
+            panic!("a group may only declare one layout");
+        }
+        if self.last_registration.is_some() {
+            panic!("a layout must be declared before routes and groups");
+        }
+        self.layout_declared = true;
+        self.layouts.push(Rc::new(move |route, window, cx| {
+            factory.render(route, window, cx)
+        }));
         self
     }
 
@@ -489,15 +515,25 @@ impl RouterConfig {
     }
 
     fn insert(&mut self, path: String, original_path: String, factory: RouteFactory) {
-        self.insert_entry(path, original_path, factory, Vec::new(), Vec::new(), None);
+        self.insert_entry(
+            path,
+            original_path,
+            factory,
+            Vec::new(),
+            self.layouts.clone(),
+            Vec::new(),
+            None,
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_entry(
         &mut self,
         path: String,
         original_path: String,
         factory: RouteFactory,
         guards: Vec<RouteGuard>,
+        layouts: Vec<LayoutFactory>,
         constraints: Vec<CompiledParamConstraint>,
         name: Option<String>,
     ) {
@@ -547,6 +583,7 @@ impl RouterConfig {
             path,
             factory,
             guards,
+            layouts,
             name: None,
             constraints,
             matchers,
@@ -844,6 +881,57 @@ mod tests {
         GuardResult, ParamConstraint, ParamError, Redirect, RouterConfig, normalize_location,
         normalize_path,
     };
+
+    #[test]
+    fn attaches_a_layout_to_routes_in_the_current_group() {
+        let config = RouterConfig::new()
+            .layout(|| "shell")
+            .route("/", || "home")
+            .group("/dashboard", |routes| {
+                routes
+                    .layout(|| "dashboard")
+                    .index(|| "dashboard home")
+                    .route("settings", || "settings")
+            })
+            .route("/about", || "about");
+
+        assert_eq!(config.routes[0].layouts.len(), 1);
+        assert_eq!(config.routes[1].layouts.len(), 2);
+        assert_eq!(config.routes[2].layouts.len(), 2);
+        assert_eq!(config.routes[3].layouts.len(), 1);
+    }
+
+    #[test]
+    fn nests_layouts_from_recursive_groups() {
+        let config = RouterConfig::new().group("/dashboard", |routes| {
+            routes.layout(|| "dashboard").group("users", |routes| {
+                routes.layout(|| "users").route("{id}", || "user")
+            })
+        });
+
+        assert_eq!(config.routes[0].layouts.len(), 2);
+    }
+
+    #[test]
+    fn groups_without_a_layout_do_not_wrap_their_routes() {
+        let config = RouterConfig::new()
+            .layout(|| "shell")
+            .group("/dashboard", |routes| routes.index(|| "dashboard"));
+
+        assert_eq!(config.routes[0].layouts.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "a group may only declare one layout")]
+    fn rejects_a_second_layout_on_the_same_group() {
+        let _ = RouterConfig::new().layout(|| "first").layout(|| "second");
+    }
+
+    #[test]
+    #[should_panic(expected = "a layout must be declared before routes and groups")]
+    fn rejects_a_layout_after_a_route() {
+        let _ = RouterConfig::new().route("/", || "home").layout(|| "shell");
+    }
 
     #[test]
     fn generates_named_route_urls_and_puts_leftovers_in_the_query_string() {
