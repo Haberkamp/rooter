@@ -43,10 +43,13 @@ impl Render for AppView {
 
 See `examples/simple.rs` for a complete application and
 `examples/multi_file/` for an application with one file per page.
+`examples/nested.rs` demonstrates recursive groups, group index routes,
+dynamic segments, and scoped catch-alls.
 
 ```sh
 cargo run --example simple
 cargo run --example multi_file
+cargo run --example nested
 ```
 
 ## Development

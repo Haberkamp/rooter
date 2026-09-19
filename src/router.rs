@@ -1,4 +1,4 @@
-use crate::RouterConfig;
+use crate::{RouterConfig, config::normalize_path};
 use gpui::{
     App, AppContext, Context, Empty, Entity, Global, IntoElement, Render, SharedString, WeakEntity,
     Window, WindowId,
@@ -37,7 +37,7 @@ impl Router {
     }
 
     pub fn navigate(&mut self, path: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.location = path.into();
+        self.location = normalize_path(path.into().as_ref()).into();
         cx.notify();
     }
 
@@ -60,7 +60,7 @@ impl Render for Router {
         let Some(index) = self.config.match_index(&self.location) else {
             return Empty.into_any_element();
         };
-        (self.config.routes[index].1)(window, cx).into_any_element()
+        (self.config.routes[index].factory)(window, cx).into_any_element()
     }
 }
 
@@ -120,6 +120,14 @@ mod tests {
         assert_eq!(
             router.read_with(cx, |router, _| router.location().to_owned()),
             "/about"
+        );
+
+        router.update(cx, |router, cx| {
+            router.navigate("//dashboard///settings/", cx)
+        });
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/dashboard/settings"
         );
     }
 
@@ -193,6 +201,46 @@ mod tests {
 
         assert!(home.load(Ordering::SeqCst) > 0);
         assert_eq!(about.load(Ordering::SeqCst), 0);
+    }
+
+    #[gpui::test]
+    async fn grouped_index_routes_render_lazily(cx: &mut TestAppContext) {
+        let dashboard = Arc::new(AtomicUsize::new(0));
+        let settings = Arc::new(AtomicUsize::new(0));
+        let dashboard_factory = dashboard.clone();
+        let settings_factory = settings.clone();
+        let config = RouterConfig::new().group("dashboard", |routes| {
+            routes
+                .index(move |_: &mut Window, _: &mut App| {
+                    dashboard_factory.fetch_add(1, Ordering::SeqCst);
+                    "dashboard"
+                })
+                .route("settings", move |_: &mut Window, _: &mut App| {
+                    settings_factory.fetch_add(1, Ordering::SeqCst);
+                    "settings"
+                })
+        });
+
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        router.update(&mut visual, |router, cx| router.navigate("/dashboard", cx));
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        assert!(dashboard.load(Ordering::SeqCst) > 0);
+        assert_eq!(settings.load(Ordering::SeqCst), 0);
+
+        router.update(&mut visual, |router, cx| {
+            router.navigate("/dashboard/settings/", cx)
+        });
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        assert!(settings.load(Ordering::SeqCst) > 0);
     }
 
     fn router_for_window(
