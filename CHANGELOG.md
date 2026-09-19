@@ -9,6 +9,8 @@ version.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-19
+
 ### Changed
 
 - `NavLink::param` is only available on links created with `NavLink::named`.
