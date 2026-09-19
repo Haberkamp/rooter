@@ -1,6 +1,6 @@
 use gpui::prelude::*;
 use gpui::{App, Application, Context, Entity, Window, WindowOptions, div};
-use rooter::{NavLink, RouteContext, Router, RouterConfig};
+use rooter::{ActiveMatch, NavLink, RouteContext, Router, RouterConfig};
 
 fn routes() -> RouterConfig {
     RouterConfig::new()
@@ -63,11 +63,31 @@ impl Render for AppView {
                 div()
                     .flex()
                     .gap_4()
-                    .child(NavLink::to("/").child("Home"))
-                    .child(NavLink::to("/dashboard").child("Dashboard"))
-                    .child(NavLink::to("/dashboard/settings").child("Settings"))
-                    .child(NavLink::to("/dashboard/users").child("Users"))
-                    .child(NavLink::to("/dashboard/users/42").child("User 42")),
+                    .child(
+                        NavLink::to("/")
+                            .when_active(None, |link| link.underline())
+                            .child("Home"),
+                    )
+                    .child(
+                        NavLink::to("/dashboard")
+                            .when_active(ActiveMatch::Partial, |link| link.underline())
+                            .child("Dashboard"),
+                    )
+                    .child(
+                        NavLink::to("/dashboard/settings")
+                            .when_active(None, |link| link.underline())
+                            .child("Settings"),
+                    )
+                    .child(
+                        NavLink::to("/dashboard/users")
+                            .when_active(ActiveMatch::Partial, |link| link.underline())
+                            .child("Users"),
+                    )
+                    .child(
+                        NavLink::to("/dashboard/users/42")
+                            .when_active(None, |link| link.underline())
+                            .child("User 42"),
+                    ),
             )
             .child(self.router.clone())
     }
