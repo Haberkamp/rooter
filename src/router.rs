@@ -5,7 +5,11 @@ use gpui::{
 };
 use std::collections::HashMap;
 
+/// How the current location was reached.
+///
+/// Extra variants may be added in 0.x without a major version bump.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum NavigationKind {
     Push,
     Replace,
@@ -13,7 +17,11 @@ pub enum NavigationKind {
     Forward,
 }
 
+/// Emitted after the location changes.
+///
+/// Extra fields may be added in 0.x without a major version bump.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct NavigationEvent {
     pub from: String,
     pub to: String,
@@ -72,6 +80,10 @@ impl Router {
         self.index + 1 < self.entries.len()
     }
 
+    /// Push `path` onto the history stack.
+    ///
+    /// No-ops without emitting an event when `path` normalizes to the current
+    /// location.
     pub fn navigate(&mut self, path: impl Into<SharedString>, cx: &mut Context<Self>) {
         let path = normalize_location(path.into().as_ref());
         if self.location() == path {
@@ -89,6 +101,10 @@ impl Router {
         cx.notify();
     }
 
+    /// Replace the current history entry with `path`.
+    ///
+    /// No-ops without emitting an event when `path` normalizes to the current
+    /// location.
     pub fn replace(&mut self, path: impl Into<SharedString>, cx: &mut Context<Self>) {
         let path = normalize_location(path.into().as_ref());
         if self.location() == path {
@@ -104,6 +120,9 @@ impl Router {
         cx.notify();
     }
 
+    /// Move back one history entry.
+    ///
+    /// No-ops without emitting an event when there is no previous entry.
     pub fn back(&mut self, cx: &mut Context<Self>) {
         if !self.can_go_back() {
             return;
@@ -118,6 +137,9 @@ impl Router {
         cx.notify();
     }
 
+    /// Move forward one history entry.
+    ///
+    /// No-ops without emitting an event when there is no next entry.
     pub fn forward(&mut self, cx: &mut Context<Self>) {
         if !self.can_go_forward() {
             return;
@@ -132,6 +154,10 @@ impl Router {
         cx.notify();
     }
 
+    /// Build a URL for a named route.
+    ///
+    /// Returns [`UrlError`] if the name is unknown or a required path parameter
+    /// is missing. Extra query parameters are appended to the generated path.
     pub fn url<K, V>(
         &self,
         name: &str,
@@ -144,18 +170,34 @@ impl Router {
         self.config.url(name, params)
     }
 
+    /// Navigate using the router attached to `window`.
+    ///
+    /// Returns `false` when this window has no router. Returns `true` after
+    /// calling [`navigate`](Self::navigate), including when that call no-ops.
     pub fn navigate_window(window: &Window, cx: &mut App, path: impl Into<SharedString>) -> bool {
         update_window_router(window, cx, |router, cx| router.navigate(path, cx))
     }
 
+    /// Replace using the router attached to `window`.
+    ///
+    /// Returns `false` when this window has no router. Returns `true` after
+    /// calling [`replace`](Self::replace), including when that call no-ops.
     pub fn replace_window(window: &Window, cx: &mut App, path: impl Into<SharedString>) -> bool {
         update_window_router(window, cx, |router, cx| router.replace(path, cx))
     }
 
+    /// Move back using the router attached to `window`.
+    ///
+    /// Returns `false` when this window has no router. Returns `true` after
+    /// calling [`back`](Self::back), including when that call no-ops.
     pub fn back_window(window: &Window, cx: &mut App) -> bool {
         update_window_router(window, cx, |router, cx| router.back(cx))
     }
 
+    /// Move forward using the router attached to `window`.
+    ///
+    /// Returns `false` when this window has no router. Returns `true` after
+    /// calling [`forward`](Self::forward), including when that call no-ops.
     pub fn forward_window(window: &Window, cx: &mut App) -> bool {
         update_window_router(window, cx, |router, cx| router.forward(cx))
     }

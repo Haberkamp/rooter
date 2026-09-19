@@ -54,6 +54,35 @@ cargo run --example nested
 cargo run --example layouts
 ```
 
+## Compatibility
+
+This crate tracks **gpui 0.2.x**. GPUI is still evolving; a GPUI breaking
+release may require a breaking rooter release.
+
+Minimum supported Rust: **1.88** (see `rust-version` in `Cargo.toml`).
+
+## Versioning
+
+rooter stays on **0.x** until both this API and GPUI settle. During 0.x:
+
+- Breaking public API changes bump the **minor** version (0.1 → 0.2).
+- Compatible fixes and additions bump the **patch** version.
+
+`matchit` and `regex` are implementation details and are not re-exported.
+
+See [CHANGELOG.md](CHANGELOG.md) for released changes.
+
+## Navigation behavior
+
+`navigate` and `replace` no-op (no history change, no `NavigationEvent`) when
+the path normalizes to the current location. `back` and `forward` no-op at the
+ends of the stack. `Router::url` returns `UrlError` for an unknown name or a
+missing path parameter; extra parameters become query string entries.
+
+`navigate_window` / `replace_window` / `back_window` / `forward_window` return
+`false` only when the window has no attached router. They return `true` even
+when the underlying method no-ops.
+
 ## Layouts and stateful chrome
 
 `.layout()` wraps every route in the current group. Put `Outlet` where the child
