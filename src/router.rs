@@ -141,7 +141,7 @@ impl Render for Router {
             let guard_result = self.config.routes[matched.index]
                 .guards
                 .iter()
-                .map(|guard| guard(window, cx))
+                .map(|guard| guard(matched.context.clone(), window, cx))
                 .find(|result| !matches!(result, GuardResult::Allow));
             match guard_result {
                 Some(GuardResult::Deny) => return Empty.into_any_element(),
@@ -435,7 +435,7 @@ mod tests {
         let config = RouterConfig::new()
             .route("/", || "home")
             .route("/account", || "account")
-            .guard(|_, _| crate::GuardResult::Redirect("/login".to_owned()))
+            .guard(|| crate::GuardResult::Redirect("/login".to_owned()))
             .route("/login", || "login");
         let window = cx.add_window(|window, cx| Root {
             router: Router::attach(window, cx, config),
@@ -671,7 +671,7 @@ mod tests {
                 page_renders.fetch_add(1, Ordering::SeqCst);
                 "private"
             })
-            .guard(|_, _| crate::GuardResult::Deny);
+            .guard(|| crate::GuardResult::Deny);
         let window = cx.add_window(|window, cx| Root {
             router: Router::attach(window, cx, config),
         });
@@ -686,12 +686,84 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn route_aware_guards_receive_the_matched_context(cx: &mut TestAppContext) {
+        let captured = Arc::new(Mutex::new(None));
+        let guard_captured = captured.clone();
+        let config = RouterConfig::new().route("/users/{id}", || "user").guard(
+            move |route: crate::RouteContext| {
+                *guard_captured.lock().unwrap() = Some((
+                    route.path().to_owned(),
+                    route.param("id").map(str::to_owned),
+                    route.query("tab").map(str::to_owned),
+                ));
+                crate::GuardResult::Allow
+            },
+        );
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        router.update(&mut visual, |router, cx| {
+            router.navigate("/users/42?tab=billing", cx)
+        });
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router
+        });
+
+        assert_eq!(
+            captured.lock().unwrap().as_ref(),
+            Some(&(
+                "/users/42".to_owned(),
+                Some("42".to_owned()),
+                Some("billing".to_owned())
+            ))
+        );
+    }
+
+    #[gpui::test]
+    async fn route_aware_guards_can_deny_based_on_parameters(cx: &mut TestAppContext) {
+        let renders = Arc::new(AtomicUsize::new(0));
+        let page_renders = renders.clone();
+        let config = RouterConfig::new()
+            .route("/users/{id}", move || {
+                page_renders.fetch_add(1, Ordering::SeqCst);
+                "user"
+            })
+            .guard(|route: crate::RouteContext| {
+                if route.param("id") == Some("42") {
+                    crate::GuardResult::Allow
+                } else {
+                    crate::GuardResult::Deny
+                }
+            });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        router.update(&mut visual, |router, cx| router.navigate("/users/7", cx));
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        assert_eq!(renders.load(Ordering::SeqCst), 0);
+
+        router.update(&mut visual, |router, cx| router.navigate("/users/42", cx));
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router
+        });
+        assert!(renders.load(Ordering::SeqCst) > 0);
+    }
+
+    #[gpui::test]
     async fn redirecting_guards_change_the_current_location(cx: &mut TestAppContext) {
         let login_renders = Arc::new(AtomicUsize::new(0));
         let login_page_renders = login_renders.clone();
         let config = RouterConfig::new()
             .route("/", || "private")
-            .guard(|_, _| crate::GuardResult::Redirect("/login".to_owned()))
+            .guard(|| crate::GuardResult::Redirect("/login".to_owned()))
             .route("/login", move || {
                 login_page_renders.fetch_add(1, Ordering::SeqCst);
                 "login"
