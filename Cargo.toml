@@ -2,5 +2,16 @@
 name = "rooter"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
+gpui = "0.2.2"
+matchit = "0.8.6"
+
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
+
+[[example]]
+name = "multi_file"
+path = "examples/multi_file/main.rs"

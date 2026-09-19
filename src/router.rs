@@ -1,0 +1,207 @@
+use crate::RouterConfig;
+use gpui::{
+    App, AppContext, Context, Empty, Entity, Global, IntoElement, Render, SharedString, WeakEntity,
+    Window, WindowId,
+};
+use std::collections::HashMap;
+
+#[derive(Default)]
+struct WindowRouters(HashMap<WindowId, WeakEntity<Router>>);
+
+impl Global for WindowRouters {}
+
+pub struct Router {
+    location: SharedString,
+    #[allow(dead_code)]
+    config: RouterConfig,
+}
+
+impl Router {
+    pub fn attach<T: 'static>(
+        window: &mut Window,
+        cx: &mut Context<T>,
+        config: RouterConfig,
+    ) -> Entity<Self> {
+        let router = cx.new(|_| Self {
+            location: "/".into(),
+            config,
+        });
+        cx.default_global::<WindowRouters>()
+            .0
+            .insert(window.window_handle().window_id(), router.downgrade());
+        router
+    }
+
+    pub fn location(&self) -> &str {
+        &self.location
+    }
+
+    pub fn navigate(&mut self, path: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.location = path.into();
+        cx.notify();
+    }
+
+    pub fn navigate_window(window: &Window, cx: &mut App, path: impl Into<SharedString>) -> bool {
+        let router = cx
+            .try_global::<WindowRouters>()
+            .and_then(|routers| routers.0.get(&window.window_handle().window_id()))
+            .and_then(WeakEntity::upgrade);
+        let Some(router) = router else {
+            return false;
+        };
+        let path = path.into();
+        router.update(cx, |router, cx| router.navigate(path, cx));
+        true
+    }
+}
+
+impl Render for Router {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(index) = self.config.match_index(&self.location) else {
+            return Empty.into_any_element();
+        };
+        (self.config.routes[index].1)(window, cx).into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{App, ParentElement, TestAppContext, div, point, px, size};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Root {
+        router: Entity<Router>,
+    }
+
+    impl Render for Root {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().child(self.router.clone())
+        }
+    }
+
+    fn config() -> RouterConfig {
+        RouterConfig::new()
+            .route("/", |_, _| "home")
+            .route("/about", |_, _| "about")
+            .route("/{*rest}", |_, _| "not found")
+    }
+
+    #[test]
+    fn matches_static_and_catch_all_routes() {
+        let config = config();
+        assert_eq!(config.match_index("/"), Some(0));
+        assert_eq!(config.match_index("/about"), Some(1));
+        assert_eq!(config.match_index("/missing/path"), Some(2));
+    }
+
+    #[test]
+    fn returns_none_without_a_matching_route() {
+        let config = RouterConfig::new().route("/", |_, _| "home");
+        assert_eq!(config.match_index("/missing"), None);
+    }
+
+    #[gpui::test]
+    async fn router_defaults_to_root_and_navigates(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let root = window.root(cx).unwrap();
+        let router = root.read_with(cx, |root, _| root.router.clone());
+
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/"
+        );
+        router.update(cx, |router, cx| router.navigate("/about", cx));
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/about"
+        );
+    }
+
+    #[gpui::test]
+    async fn routers_are_independent_per_window(cx: &mut TestAppContext) {
+        let first = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let second = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let first_router = first
+            .root(cx)
+            .unwrap()
+            .read_with(cx, |root, _| root.router.clone());
+        let second_router = second
+            .root(cx)
+            .unwrap()
+            .read_with(cx, |root, _| root.router.clone());
+
+        first_router.update(cx, |router, cx| router.navigate("/about", cx));
+        assert_eq!(
+            first_router.read_with(cx, |router, _| router.location().to_owned()),
+            "/about"
+        );
+        assert_eq!(
+            second_router.read_with(cx, |router, _| router.location().to_owned()),
+            "/"
+        );
+    }
+
+    #[gpui::test]
+    async fn window_navigation_resolves_the_attached_router(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        assert!(visual.update(|window, cx| { Router::navigate_window(window, cx, "/about") }));
+        assert_eq!(
+            router.read_with(&visual, |router, _| router.location().to_owned()),
+            "/about"
+        );
+    }
+
+    #[gpui::test]
+    async fn only_the_matched_factory_is_rendered(cx: &mut TestAppContext) {
+        let home = Arc::new(AtomicUsize::new(0));
+        let about = Arc::new(AtomicUsize::new(0));
+        let home_factory = home.clone();
+        let about_factory = about.clone();
+        let config = RouterConfig::new()
+            .route("/", move |_: &mut Window, _: &mut App| {
+                home_factory.fetch_add(1, Ordering::SeqCst);
+                "home"
+            })
+            .route("/about", move |_: &mut Window, _: &mut App| {
+                about_factory.fetch_add(1, Ordering::SeqCst);
+                "about"
+            });
+
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router
+        });
+
+        assert!(home.load(Ordering::SeqCst) > 0);
+        assert_eq!(about.load(Ordering::SeqCst), 0);
+    }
+
+    fn router_for_window(
+        window: &gpui::WindowHandle<Root>,
+        cx: &mut TestAppContext,
+    ) -> Entity<Router> {
+        window
+            .root(cx)
+            .unwrap()
+            .read_with(cx, |root, _| root.router.clone())
+    }
+}

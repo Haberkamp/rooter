@@ -1,0 +1,74 @@
+# rooter
+
+A small, window-scoped router for [GPUI](https://www.gpui.rs/).
+
+Each window owns its own router and navigation state. Routes are configured once,
+and `NavLink` automatically uses the router attached to its window.
+
+## Example
+
+```rust
+use gpui::prelude::*;
+use gpui::{App, Context, Entity, Window, div};
+use rooter::{NavLink, Router, RouterConfig};
+
+fn routes() -> RouterConfig {
+    RouterConfig::new()
+        .route("/", |_, _| div().child("Home"))
+        .route("/about", |_, _| div().child("About"))
+        .route("/{*rest}", |_, _| div().child("Page not found"))
+}
+
+struct AppView {
+    router: Entity<Router>,
+}
+
+impl AppView {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self {
+            router: Router::attach(window, cx, routes()),
+        }
+    }
+}
+
+impl Render for AppView {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .child(NavLink::to("/").child("Home"))
+            .child(NavLink::to("/about").child("About"))
+            .child(self.router.clone())
+    }
+}
+```
+
+See `examples/simple.rs` for a complete application and
+`examples/multi_file/` for an application with one file per page.
+
+```sh
+cargo run --example simple
+cargo run --example multi_file
+```
+
+## Development
+
+Run the tests:
+
+```sh
+cargo test --all-targets
+```
+
+Check formatting:
+
+```sh
+cargo fmt --check
+```
+
+Run the linter:
+
+```sh
+cargo clippy --all-targets -- -D warnings
+```
+
+## License
+
+Licensed under the MIT License. See [LICENSE](LICENSE).
