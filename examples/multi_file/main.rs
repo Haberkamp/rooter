@@ -20,8 +20,20 @@ impl AppView {
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .child(NavLink::to("/").child("Home"))
-            .child(NavLink::to("/about").child("About"))
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .p_4()
+            .bg(gpui::white())
+            .text_color(gpui::black())
+            .child(
+                div()
+                    .flex()
+                    .gap_4()
+                    .child(NavLink::to("/").child("Home"))
+                    .child(NavLink::to("/about").child("About")),
+            )
             .child(self.router.clone())
     }
 }

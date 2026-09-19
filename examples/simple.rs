@@ -10,15 +10,30 @@ fn routes() -> RouterConfig {
 }
 
 fn home() -> impl IntoElement {
-    div().child("Home")
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child("Welcome to the rooter example.")
+        .child("Use the links above to move between pages.")
 }
 
 fn about() -> impl IntoElement {
-    div().child("About")
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child("rooter is a small, window-scoped router for GPUI.")
+        .child("Each window keeps its own route and navigation state.")
 }
 
 fn not_found() -> impl IntoElement {
-    div().child("Page not found")
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child("The requested route is not part of this example.")
+        .child("Use the navigation above to return to a known page.")
 }
 
 struct HelloWorld {
@@ -36,8 +51,20 @@ impl HelloWorld {
 impl Render for HelloWorld {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .child(NavLink::to("/").child(div().child("Home")))
-            .child(NavLink::to("/about").child(div().child("About")))
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .p_4()
+            .bg(gpui::white())
+            .text_color(gpui::black())
+            .child(
+                div()
+                    .flex()
+                    .gap_4()
+                    .child(NavLink::to("/").child(div().child("Home")))
+                    .child(NavLink::to("/about").child(div().child("About"))),
+            )
             .child(self.router.clone())
     }
 }
