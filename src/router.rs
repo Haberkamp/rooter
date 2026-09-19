@@ -1,4 +1,4 @@
-use crate::{GuardResult, RouterConfig, config::normalize_path};
+use crate::{GuardResult, RouterConfig, config::normalize_location};
 use gpui::{
     App, AppContext, Context, Empty, Entity, Global, IntoElement, Render, SharedString, WeakEntity,
     Window, WindowId,
@@ -31,7 +31,7 @@ impl Router {
         config: RouterConfig,
         path: impl Into<SharedString>,
     ) -> Entity<Self> {
-        let location: SharedString = normalize_path(path.into().as_ref()).into();
+        let location: SharedString = normalize_location(path.into().as_ref()).into();
         let router = cx.new(|_| Self {
             entries: vec![location],
             index: 0,
@@ -56,7 +56,7 @@ impl Router {
     }
 
     pub fn navigate(&mut self, path: impl Into<SharedString>, cx: &mut Context<Self>) {
-        let path = normalize_path(path.into().as_ref());
+        let path = normalize_location(path.into().as_ref());
         if self.location() == path {
             return;
         }
@@ -67,7 +67,7 @@ impl Router {
     }
 
     pub fn replace(&mut self, path: impl Into<SharedString>, cx: &mut Context<Self>) {
-        let path = normalize_path(path.into().as_ref());
+        let path = normalize_location(path.into().as_ref());
         if self.location() == path {
             return;
         }
@@ -146,7 +146,7 @@ impl Render for Router {
             match guard_result {
                 Some(GuardResult::Deny) => return Empty.into_any_element(),
                 Some(GuardResult::Redirect(path)) => {
-                    let path = normalize_path(&path);
+                    let path = normalize_location(&path);
                     if self.location() == path || redirects_remaining == 0 {
                         return Empty.into_any_element();
                     }
@@ -554,6 +554,62 @@ mod tests {
         });
 
         assert_eq!(captured_id.lock().unwrap().as_deref(), Some("42"));
+    }
+
+    #[gpui::test]
+    async fn query_values_are_passed_to_the_page_factory(cx: &mut TestAppContext) {
+        let captured_query = Arc::new(Mutex::new(None));
+        let page_query = captured_query.clone();
+        let config = RouterConfig::new().route("/search", move |route: crate::RouteContext| {
+            *page_query.lock().unwrap() = route.query("q").map(str::to_owned);
+            "search"
+        });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        router.update(&mut visual, |router, cx| {
+            router.navigate("/search?q=rooter", cx)
+        });
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+
+        assert_eq!(captured_query.lock().unwrap().as_deref(), Some("rooter"));
+        assert_eq!(
+            router.read_with(&visual, |router, _| router.location().to_owned()),
+            "/search?q=rooter"
+        );
+    }
+
+    #[gpui::test]
+    async fn query_changes_push_history_entries(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let router = router_for_window(&window, cx);
+
+        router.update(cx, |router, cx| router.navigate("/search?q=a", cx));
+        router.update(cx, |router, cx| router.navigate("/search?q=b", cx));
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/search?q=b"
+        );
+
+        router.update(cx, |router, cx| router.back(cx));
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/search?q=a"
+        );
+
+        router.update(cx, |router, cx| router.navigate("/search?q=a", cx));
+        assert!(router.read_with(cx, |router, _| router.can_go_forward()));
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/search?q=a"
+        );
     }
 
     #[gpui::test]

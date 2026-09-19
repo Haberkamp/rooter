@@ -1,4 +1,4 @@
-use crate::{Router, config::normalize_path};
+use crate::{Router, config::location_path};
 use gpui::{
     AnyElement, App, Div, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce,
     SharedString, Stateful, StatefulInteractiveElement, Window, div,
@@ -68,8 +68,8 @@ impl RenderOnce for NavLink {
 }
 
 fn location_matches(location: &str, to: &str, mode: ActiveMatch) -> bool {
-    let location = normalize_path(location);
-    let to = normalize_path(to);
+    let location = location_path(location);
+    let to = location_path(to);
     match mode {
         ActiveMatch::Partial => {
             to == "/" || location == to || location.starts_with(&format!("{to}/"))
@@ -120,6 +120,16 @@ mod tests {
             ActiveMatch::Exact
         ));
         assert!(!location_matches("/about", "/", ActiveMatch::Exact));
+        assert!(location_matches(
+            "/search?q=rooter",
+            "/search",
+            ActiveMatch::Exact
+        ));
+        assert!(!location_matches(
+            "/search?q=rooter",
+            "/about",
+            ActiveMatch::Exact
+        ));
     }
 
     #[test]

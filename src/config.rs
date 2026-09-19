@@ -109,6 +109,7 @@ where
 pub struct RouteContext {
     path: String,
     params: Vec<(String, String)>,
+    query: Vec<(String, String)>,
 }
 
 impl RouteContext {
@@ -117,21 +118,27 @@ impl RouteContext {
     }
 
     pub fn param(&self, name: &str) -> Option<&str> {
-        self.params
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
+        lookup_pair(&self.params, name)
+    }
+
+    pub fn query(&self, name: &str) -> Option<&str> {
+        lookup_pair(&self.query, name)
     }
 
     pub fn param_as<T: std::str::FromStr>(&self, name: &str) -> Result<T, ParamError<T::Err>> {
-        self.param(name)
-            .ok_or_else(|| ParamError::Missing(name.to_owned()))?
-            .parse()
-            .map_err(ParamError::Parse)
+        parse_required(self.param(name), name)
+    }
+
+    pub fn query_as<T: std::str::FromStr>(&self, name: &str) -> Result<T, ParamError<T::Err>> {
+        parse_required(self.query(name), name)
     }
 
     pub fn optional_param_as<T: std::str::FromStr>(&self, name: &str) -> Result<Option<T>, T::Err> {
         self.param(name).map(str::parse).transpose()
+    }
+
+    pub fn optional_query_as<T: std::str::FromStr>(&self, name: &str) -> Result<Option<T>, T::Err> {
+        self.query(name).map(str::parse).transpose()
     }
 }
 
@@ -169,6 +176,19 @@ pub(crate) fn normalize_path(path: &str) -> String {
     } else {
         format!("/{}", segments.join("/"))
     }
+}
+
+pub(crate) fn normalize_location(location: &str) -> String {
+    let (path, query) = parse_location(location);
+    if query.is_empty() {
+        path
+    } else {
+        format!("{path}?{}", serialize_query(&query))
+    }
+}
+
+pub(crate) fn location_path(location: &str) -> String {
+    parse_location(location).0
 }
 
 pub struct RouterConfig {
@@ -386,18 +406,19 @@ impl RouterConfig {
         self.last_registration = Some(LastRegistration::Route(index));
     }
 
-    pub(crate) fn match_route(&self, path: &str) -> Option<MatchedRoute> {
+    pub(crate) fn match_route(&self, location: &str) -> Option<MatchedRoute> {
+        let (path, query) = parse_location(location);
         self.routes
             .iter()
             .enumerate()
             .filter(|(_, route)| !route.is_catch_all)
-            .find_map(|(index, route)| matched_route(index, route, path))
+            .find_map(|(index, route)| matched_route(index, route, &path, &query))
             .or_else(|| {
                 self.routes
                     .iter()
                     .enumerate()
                     .filter(|(_, route)| route.is_catch_all)
-                    .find_map(|(index, route)| matched_route(index, route, path))
+                    .find_map(|(index, route)| matched_route(index, route, &path, &query))
             })
     }
 
@@ -413,7 +434,12 @@ impl RouterConfig {
     }
 }
 
-fn matched_route(index: usize, route: &RouteEntry, path: &str) -> Option<MatchedRoute> {
+fn matched_route(
+    index: usize,
+    route: &RouteEntry,
+    path: &str,
+    query: &[(String, String)],
+) -> Option<MatchedRoute> {
     for matcher in &route.matchers {
         let Ok(matched) = matcher.matcher.at(path) else {
             continue;
@@ -436,10 +462,100 @@ fn matched_route(index: usize, route: &RouteEntry, path: &str) -> Option<Matched
             context: RouteContext {
                 path: path.to_owned(),
                 params,
+                query: query.to_vec(),
             },
         });
     }
     None
+}
+
+fn lookup_pair<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
+fn parse_required<T: std::str::FromStr>(
+    value: Option<&str>,
+    name: &str,
+) -> Result<T, ParamError<T::Err>> {
+    value
+        .ok_or_else(|| ParamError::Missing(name.to_owned()))?
+        .parse()
+        .map_err(ParamError::Parse)
+}
+
+fn parse_location(location: &str) -> (String, Vec<(String, String)>) {
+    let without_hash = location
+        .split_once('#')
+        .map(|(path, _)| path)
+        .unwrap_or(location);
+    let (path, query) = without_hash.split_once('?').unwrap_or((without_hash, ""));
+    (normalize_path(path), parse_query(query))
+}
+
+fn parse_query(query: &str) -> Vec<(String, String)> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (percent_decode(key), percent_decode(value))
+        })
+        .collect()
+}
+
+fn serialize_query(query: &[(String, String)]) -> String {
+    query
+        .iter()
+        .map(|(key, value)| format!("{}={}", percent_encode(key), percent_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (from_hex(bytes[index + 1]), from_hex(bytes[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn percent_encode(input: &str) -> String {
+    let mut encoded = String::new();
+    for byte in input.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn from_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn route_parameter_names(path: &str) -> impl Iterator<Item = &str> {
@@ -526,7 +642,43 @@ impl Default for RouterConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{GuardResult, ParamConstraint, ParamError, RouterConfig, normalize_path};
+    use super::{
+        GuardResult, ParamConstraint, ParamError, RouterConfig, normalize_location, normalize_path,
+    };
+
+    #[test]
+    fn matches_the_path_and_exposes_query_values() {
+        let config = RouterConfig::new().route("/search", || "search");
+        let matched = config.match_route("/search?q=rooter&sort=name").unwrap();
+
+        assert_eq!(matched.context.path(), "/search");
+        assert_eq!(matched.context.query("q"), Some("rooter"));
+        assert_eq!(matched.context.query("sort"), Some("name"));
+        assert_eq!(matched.context.query("missing"), None);
+    }
+
+    #[test]
+    fn decodes_query_values_and_returns_the_first_duplicate() {
+        let config = RouterConfig::new().route("/search", || "search");
+        let matched = config
+            .match_route("/search?q=hello%20world&q=second")
+            .unwrap();
+
+        assert_eq!(matched.context.query("q"), Some("hello world"));
+    }
+
+    #[test]
+    fn parses_typed_query_values() {
+        let config = RouterConfig::new().route("/items", || "items");
+        let matched = config.match_route("/items?page=2").unwrap();
+
+        assert_eq!(matched.context.query_as::<u64>("page"), Ok(2));
+        assert_eq!(
+            matched.context.query_as::<u64>("limit"),
+            Err(ParamError::Missing("limit".to_owned()))
+        );
+        assert_eq!(matched.context.optional_query_as::<u64>("limit"), Ok(None));
+    }
 
     #[test]
     fn parses_typed_route_parameters() {
@@ -856,6 +1008,19 @@ mod tests {
         assert_eq!(
             normalize_path("//dashboard///settings/"),
             "/dashboard/settings"
+        );
+    }
+
+    #[test]
+    fn normalizes_locations_with_query_strings() {
+        assert_eq!(normalize_location("/search?"), "/search");
+        assert_eq!(
+            normalize_location("//search///?q=rooter"),
+            "/search?q=rooter"
+        );
+        assert_eq!(
+            normalize_location("/search?q=rooter#ignored"),
+            "/search?q=rooter"
         );
     }
 
