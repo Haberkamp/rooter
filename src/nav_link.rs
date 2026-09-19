@@ -3,15 +3,23 @@ use gpui::{
     AnyElement, App, Div, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce,
     SharedString, Stateful, StatefulInteractiveElement, Window, div,
 };
+use std::marker::PhantomData;
 
 type ActiveStyle = Box<dyn FnOnce(Stateful<Div>) -> Stateful<Div>>;
 
+/// How a [`NavLink`] compares the current location to its target.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ActiveMatch {
     #[default]
     Exact,
     Partial,
 }
+
+#[doc(hidden)]
+pub struct PathTarget;
+
+#[doc(hidden)]
+pub struct NamedTarget;
 
 #[derive(Clone, Debug)]
 enum NavTarget {
@@ -22,26 +30,32 @@ enum NavTarget {
     },
 }
 
+/// A clickable element that navigates the window's [`Router`](crate::Router).
+///
+/// Use [`NavLink::to`] for a literal path and [`NavLink::named`] for a named
+/// route. [`NavLink::param`] is only available on named links.
 #[derive(IntoElement)]
-pub struct NavLink {
+pub struct NavLink<Target: 'static = PathTarget> {
     to: NavTarget,
     children: Vec<AnyElement>,
     match_mode: ActiveMatch,
     when_active: Option<ActiveStyle>,
+    _target: PhantomData<Target>,
 }
 
-impl NavLink {
+impl NavLink<PathTarget> {
     pub fn to(to: impl Into<SharedString>) -> Self {
         Self {
             to: NavTarget::Path(to.into()),
             children: Vec::new(),
             match_mode: ActiveMatch::Exact,
             when_active: None,
+            _target: PhantomData,
         }
     }
 
-    pub fn named(name: impl Into<SharedString>) -> Self {
-        Self {
+    pub fn named(name: impl Into<SharedString>) -> NavLink<NamedTarget> {
+        NavLink {
             to: NavTarget::Named {
                 name: name.into(),
                 params: Vec::new(),
@@ -49,18 +63,21 @@ impl NavLink {
             children: Vec::new(),
             match_mode: ActiveMatch::Exact,
             when_active: None,
+            _target: PhantomData,
         }
     }
+}
 
+impl NavLink<NamedTarget> {
     pub fn param(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         if let NavTarget::Named { params, .. } = &mut self.to {
             params.push((key.into(), value.into()));
-        } else {
-            panic!("NavLink::param can only be used with NavLink::named");
         }
         self
     }
+}
 
+impl<Target> NavLink<Target> {
     pub fn when_active(
         mut self,
         mode: impl Into<Option<ActiveMatch>>,
@@ -72,13 +89,13 @@ impl NavLink {
     }
 }
 
-impl ParentElement for NavLink {
+impl<Target> ParentElement for NavLink<Target> {
     fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
         self.children.extend(elements);
     }
 }
 
-impl RenderOnce for NavLink {
+impl<Target: 'static> RenderOnce for NavLink<Target> {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let Some(to) = resolve_target(&self.to, window, cx) else {
             return div().children(self.children).into_any_element();
