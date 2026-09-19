@@ -60,10 +60,10 @@ impl Render for Router {
         let mut redirects_remaining = self.config.routes.len();
 
         loop {
-            let Some(index) = self.config.match_index(&self.location) else {
+            let Some(matched) = self.config.match_route(&self.location) else {
                 return Empty.into_any_element();
             };
-            let guard_result = self.config.routes[index]
+            let guard_result = self.config.routes[matched.index]
                 .guards
                 .iter()
                 .map(|guard| guard(window, cx))
@@ -80,7 +80,12 @@ impl Render for Router {
                     cx.notify();
                 }
                 Some(GuardResult::Allow) | None => {
-                    return (self.config.routes[index].factory)(window, cx).into_any_element();
+                    return (self.config.routes[matched.index].factory)(
+                        matched.context,
+                        window,
+                        cx,
+                    )
+                    .into_any_element();
                 }
             }
         }
@@ -92,7 +97,7 @@ mod tests {
     use super::*;
     use gpui::{ParentElement, TestAppContext, div, point, px, size};
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -224,6 +229,28 @@ mod tests {
 
         assert!(home.load(Ordering::SeqCst) > 0);
         assert_eq!(about.load(Ordering::SeqCst), 0);
+    }
+
+    #[gpui::test]
+    async fn matched_parameters_are_passed_to_the_page_factory(cx: &mut TestAppContext) {
+        let captured_id = Arc::new(Mutex::new(None));
+        let page_id = captured_id.clone();
+        let config = RouterConfig::new().route("/users/{id}", move |route: crate::RouteContext| {
+            *page_id.lock().unwrap() = route.param("id").map(str::to_owned);
+            "user"
+        });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        router.update(&mut visual, |router, cx| router.navigate("/users/42", cx));
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router
+        });
+
+        assert_eq!(captured_id.lock().unwrap().as_deref(), Some("42"));
     }
 
     #[gpui::test]

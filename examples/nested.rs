@@ -1,6 +1,6 @@
 use gpui::prelude::*;
 use gpui::{App, Application, Context, Entity, Window, WindowOptions, div};
-use rooter::{NavLink, Router, RouterConfig};
+use rooter::{NavLink, RouteContext, Router, RouterConfig};
 
 fn routes() -> RouterConfig {
     RouterConfig::new()
@@ -14,9 +14,7 @@ fn routes() -> RouterConfig {
                 .group("users", |routes| {
                     routes
                         .index(|| page("This nested index matches /dashboard/users."))
-                        .route("{id}", || {
-                            page("This dynamic route matches a single user id.")
-                        })
+                        .route("{id}", user_page)
                         .route("{*rest}", || {
                             page("This catch-all is scoped to /dashboard/users.")
                         })
@@ -25,8 +23,15 @@ fn routes() -> RouterConfig {
         .route("/{*rest}", || page("This is the application catch-all."))
 }
 
-fn page(body: &'static str) -> impl IntoElement {
+fn page(body: impl IntoElement) -> impl IntoElement {
     div().child(body)
+}
+
+fn user_page(route: RouteContext) -> impl IntoElement {
+    page(format!(
+        "This dynamic route matched user id {}.",
+        route.param("id").unwrap()
+    ))
 }
 
 struct AppView {
