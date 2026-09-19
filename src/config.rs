@@ -8,7 +8,51 @@ pub(crate) type RouteGuard = Rc<dyn Fn(RouteContext, &mut Window, &mut App) -> G
 pub enum GuardResult {
     Allow,
     Deny,
-    Redirect(String),
+    Redirect(Redirect),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Redirect {
+    kind: RedirectKind,
+    params: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RedirectKind {
+    Path(String),
+    Named(String),
+}
+
+impl Redirect {
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            kind: RedirectKind::Named(name.into()),
+            params: Vec::new(),
+        }
+    }
+
+    pub fn param(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.params.push((key.into(), value.into()));
+        self
+    }
+}
+
+impl From<&str> for Redirect {
+    fn from(path: &str) -> Self {
+        Self {
+            kind: RedirectKind::Path(path.to_owned()),
+            params: Vec::new(),
+        }
+    }
+}
+
+impl From<String> for Redirect {
+    fn from(path: String) -> Self {
+        Self {
+            kind: RedirectKind::Path(path),
+            params: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,6 +236,7 @@ pub(crate) struct RouteEntry {
     pub(crate) path: String,
     pub(crate) factory: RouteFactory,
     pub(crate) guards: Vec<RouteGuard>,
+    name: Option<String>,
     constraints: Vec<CompiledParamConstraint>,
     matchers: Vec<RouteMatcher>,
     is_catch_all: bool,
@@ -328,6 +373,7 @@ impl RouterConfig {
                 route.factory,
                 route.guards,
                 route.constraints,
+                route.name,
             );
         }
         self.last_registration = Some(LastRegistration::Group(start..self.routes.len()));
@@ -385,8 +431,65 @@ impl RouterConfig {
         self
     }
 
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        let name = name.into();
+        let index = match self.last_registration.as_ref() {
+            Some(LastRegistration::Route(index)) => *index,
+            Some(LastRegistration::Group(_)) => {
+                panic!("route names cannot be applied to a group")
+            }
+            None => panic!("a route name must follow a route"),
+        };
+        self.assign_name(index, name);
+        self
+    }
+
+    pub fn url<K, V>(&self, name: &str, params: impl IntoIterator<Item = (K, V)>) -> String
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let params = params
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+        self.generate_named_url(name, params)
+    }
+
+    pub(crate) fn resolve_redirect(&self, redirect: &Redirect) -> String {
+        match &redirect.kind {
+            RedirectKind::Path(path) => normalize_location(path),
+            RedirectKind::Named(name) => self.generate_named_url(name, redirect.params.clone()),
+        }
+    }
+
+    fn generate_named_url(&self, name: &str, params: Vec<(String, String)>) -> String {
+        let Some(route) = self
+            .routes
+            .iter()
+            .find(|route| route.name.as_deref() == Some(name))
+        else {
+            panic!("unknown route name `{name}`");
+        };
+        generate_url(&route.path, name, params)
+    }
+
+    fn assign_name(&mut self, index: usize, name: String) {
+        if let Some(existing) = self
+            .routes
+            .iter()
+            .find(|route| route.name.as_deref() == Some(name.as_str()))
+        {
+            panic!(
+                "duplicate route name `{name}`: already registered by `{}`",
+                existing.path
+            );
+        }
+        self.routes[index].name = Some(name);
+    }
+
     fn insert(&mut self, path: String, original_path: String, factory: RouteFactory) {
-        self.insert_entry(path, original_path, factory, Vec::new(), Vec::new());
+        self.insert_entry(path, original_path, factory, Vec::new(), Vec::new(), None);
     }
 
     fn insert_entry(
@@ -396,6 +499,7 @@ impl RouterConfig {
         factory: RouteFactory,
         guards: Vec<RouteGuard>,
         constraints: Vec<CompiledParamConstraint>,
+        name: Option<String>,
     ) {
         if self.routes.iter().any(|route| route.path == path) {
             panic!(
@@ -443,11 +547,15 @@ impl RouterConfig {
             path,
             factory,
             guards,
+            name: None,
             constraints,
             matchers,
             is_catch_all,
         });
         self.last_registration = Some(LastRegistration::Route(index));
+        if let Some(name) = name {
+            self.assign_name(index, name);
+        }
     }
 
     pub(crate) fn match_route(&self, location: &str) -> Option<MatchedRoute> {
@@ -674,6 +782,52 @@ fn compile_constraint(constraint: ParamConstraint) -> Result<regex::Regex, regex
     regex::Regex::new(&format!("^(?:{pattern})$"))
 }
 
+fn generate_url(pattern: &str, name: &str, mut params: Vec<(String, String)>) -> String {
+    let mut segments = Vec::new();
+    for segment in pattern.split('/').filter(|segment| !segment.is_empty()) {
+        let Some(parameter) = segment
+            .strip_prefix('{')
+            .and_then(|segment| segment.strip_suffix('}'))
+        else {
+            segments.push(segment.to_owned());
+            continue;
+        };
+        if let Some(parameter) = parameter.strip_prefix('*') {
+            let value = take_param(&mut params, parameter)
+                .unwrap_or_else(|| panic!("missing parameter `{parameter}` for route `{name}`"));
+            segments.extend(
+                value
+                    .split('/')
+                    .filter(|segment| !segment.is_empty())
+                    .map(str::to_owned),
+            );
+        } else if let Some(parameter) = parameter.strip_suffix('?') {
+            if let Some(value) = take_param(&mut params, parameter) {
+                segments.push(value);
+            }
+        } else {
+            let value = take_param(&mut params, parameter)
+                .unwrap_or_else(|| panic!("missing parameter `{parameter}` for route `{name}`"));
+            segments.push(value);
+        }
+    }
+    let path = if segments.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("/{}", segments.join("/"))
+    };
+    if params.is_empty() {
+        path
+    } else {
+        format!("{path}?{}", serialize_query(&params))
+    }
+}
+
+fn take_param(params: &mut Vec<(String, String)>, name: &str) -> Option<String> {
+    let index = params.iter().position(|(key, _)| key == name)?;
+    Some(params.remove(index).1)
+}
+
 fn join_paths(prefix: &str, path: &str) -> String {
     normalize_path(&format!("{prefix}/{path}"))
 }
@@ -687,8 +841,114 @@ impl Default for RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardResult, ParamConstraint, ParamError, RouterConfig, normalize_location, normalize_path,
+        GuardResult, ParamConstraint, ParamError, Redirect, RouterConfig, normalize_location,
+        normalize_path,
     };
+
+    #[test]
+    fn generates_named_route_urls_and_puts_leftovers_in_the_query_string() {
+        let config = RouterConfig::new()
+            .route("/users/{id}", || "user")
+            .name("users.show")
+            .route("/login", || "login")
+            .name("login");
+
+        assert_eq!(config.url("users.show", [("id", "42")]), "/users/42");
+        assert_eq!(
+            config.url("users.show", [("id", "42"), ("tab", "profile")]),
+            "/users/42?tab=profile"
+        );
+        assert_eq!(config.url("login", Vec::<(&str, &str)>::new()), "/login");
+    }
+
+    #[test]
+    fn generates_optional_and_catch_all_named_route_urls() {
+        let config = RouterConfig::new()
+            .route("/users/{name?}", || "users")
+            .name("users")
+            .route("/files/{*path}", || "file")
+            .name("files.show");
+
+        assert_eq!(config.url("users", Vec::<(&str, &str)>::new()), "/users");
+        assert_eq!(config.url("users", [("name", "nils")]), "/users/nils");
+        assert_eq!(
+            config.url("files.show", [("path", "documents/2026/report.pdf")]),
+            "/files/documents/2026/report.pdf"
+        );
+    }
+
+    #[test]
+    fn generates_named_routes_registered_inside_groups() {
+        let config = RouterConfig::new().group("/dashboard", |routes| {
+            routes
+                .route("users/{id}", || "user")
+                .name("dashboard.users.show")
+        });
+
+        assert_eq!(
+            config.url("dashboard.users.show", [("id", "7")]),
+            "/dashboard/users/7"
+        );
+    }
+
+    #[test]
+    fn resolves_named_guard_redirects() {
+        let config = RouterConfig::new()
+            .route("/login", || "login")
+            .name("login")
+            .route("/users/{id}", || "user")
+            .name("users.show");
+
+        assert_eq!(config.resolve_redirect(&Redirect::named("login")), "/login");
+        assert_eq!(
+            config.resolve_redirect(
+                &Redirect::named("users.show")
+                    .param("id", "42")
+                    .param("tab", "profile")
+            ),
+            "/users/42?tab=profile"
+        );
+        assert_eq!(config.resolve_redirect(&"/account".into()), "/account");
+    }
+
+    #[test]
+    #[should_panic(expected = "missing parameter `id` for route `users.show`")]
+    fn rejects_named_urls_with_missing_required_parameters() {
+        let config = RouterConfig::new()
+            .route("/users/{id}", || "user")
+            .name("users.show");
+        let _ = config.url("users.show", Vec::<(&str, &str)>::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown route name `missing`")]
+    fn rejects_unknown_route_names() {
+        let _ = RouterConfig::new().url("missing", Vec::<(&str, &str)>::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate route name `users.show`")]
+    fn rejects_duplicate_route_names() {
+        let _ = RouterConfig::new()
+            .route("/users/{id}", || "user")
+            .name("users.show")
+            .route("/profile/{id}", || "profile")
+            .name("users.show");
+    }
+
+    #[test]
+    #[should_panic(expected = "a route name must follow a route")]
+    fn rejects_a_name_without_a_previous_route() {
+        let _ = RouterConfig::new().name("home");
+    }
+
+    #[test]
+    #[should_panic(expected = "route names cannot be applied to a group")]
+    fn rejects_names_on_groups() {
+        let _ = RouterConfig::new()
+            .group("/users", |routes| routes.route("{id}", || "user"))
+            .name("users");
+    }
 
     #[test]
     fn matches_the_path_and_exposes_query_values() {
@@ -1040,7 +1300,7 @@ mod tests {
             if route.query("tab") == Some("billing") {
                 GuardResult::Allow
             } else {
-                GuardResult::Redirect("/login".to_owned())
+                GuardResult::Redirect("/login".into())
             }
         }
 

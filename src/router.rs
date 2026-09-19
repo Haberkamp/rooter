@@ -91,6 +91,14 @@ impl Router {
         cx.notify();
     }
 
+    pub fn url<K, V>(&self, name: &str, params: impl IntoIterator<Item = (K, V)>) -> String
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.config.url(name, params)
+    }
+
     pub fn navigate_window(window: &Window, cx: &mut App, path: impl Into<SharedString>) -> bool {
         update_window_router(window, cx, |router, cx| router.navigate(path, cx))
     }
@@ -109,6 +117,15 @@ impl Router {
 
     pub(crate) fn window_location(window: &Window, cx: &App) -> Option<SharedString> {
         window_router(window, cx).map(|router| router.read(cx).location().to_owned().into())
+    }
+
+    pub(crate) fn window_url(
+        window: &Window,
+        cx: &App,
+        name: &str,
+        params: &[(String, String)],
+    ) -> Option<String> {
+        window_router(window, cx).map(|router| router.read(cx).url(name, params.iter().cloned()))
     }
 }
 
@@ -145,8 +162,8 @@ impl Render for Router {
                 .find(|result| !matches!(result, GuardResult::Allow));
             match guard_result {
                 Some(GuardResult::Deny) => return Empty.into_any_element(),
-                Some(GuardResult::Redirect(path)) => {
-                    let path = normalize_location(&path);
+                Some(GuardResult::Redirect(redirect)) => {
+                    let path = self.config.resolve_redirect(&redirect);
                     if self.location() == path || redirects_remaining == 0 {
                         return Empty.into_any_element();
                     }
@@ -435,7 +452,7 @@ mod tests {
         let config = RouterConfig::new()
             .route("/", || "home")
             .route("/account", || "account")
-            .guard(|| crate::GuardResult::Redirect("/login".to_owned()))
+            .guard(|| crate::GuardResult::Redirect("/login".into()))
             .route("/login", || "login");
         let window = cx.add_window(|window, cx| Root {
             router: Router::attach(window, cx, config),
@@ -763,7 +780,7 @@ mod tests {
         let login_page_renders = login_renders.clone();
         let config = RouterConfig::new()
             .route("/", || "private")
-            .guard(|| crate::GuardResult::Redirect("/login".to_owned()))
+            .guard(|| crate::GuardResult::Redirect("/login".into()))
             .route("/login", move || {
                 login_page_renders.fetch_add(1, Ordering::SeqCst);
                 "login"
@@ -785,6 +802,42 @@ mod tests {
             "/login"
         );
         assert!(login_renders.load(Ordering::SeqCst) > 0);
+    }
+
+    #[gpui::test]
+    async fn named_guard_redirects_are_resolved_before_navigation(cx: &mut TestAppContext) {
+        let config = RouterConfig::new()
+            .route("/account", || "account")
+            .guard(|| {
+                crate::GuardResult::Redirect(
+                    crate::Redirect::named("login").param("from", "account"),
+                )
+            })
+            .route("/login", || "login")
+            .name("login");
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        router.update(&mut visual, |router, cx| router.navigate("/account", cx));
+        visual.update(|window, cx| {
+            router.update(cx, |router, cx| {
+                router.render(window, cx).into_any_element()
+            });
+        });
+
+        assert_eq!(
+            router.read_with(&visual, |router, _| router.location().to_owned()),
+            "/login?from=account"
+        );
+        assert_eq!(
+            router.read_with(&visual, |router, _| {
+                router.url("login", [("from", "account")])
+            }),
+            "/login?from=account"
+        );
     }
 
     #[gpui::test]

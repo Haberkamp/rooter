@@ -15,6 +15,7 @@ fn routes() -> RouterConfig {
                     routes
                         .index(|| page("This nested index matches /dashboard/users."))
                         .route("{id}", user_page)
+                        .name("users.show")
                         .route("{*rest}", missing_user_page)
                 })
         })
@@ -84,7 +85,8 @@ impl Render for AppView {
                             .child("Users"),
                     )
                     .child(
-                        NavLink::to("/dashboard/users/42")
+                        NavLink::named("users.show")
+                            .param("id", "42")
                             .when_active(None, |link| link.underline())
                             .child("User 42"),
                     ),
