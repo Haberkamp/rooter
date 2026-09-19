@@ -1,4 +1,4 @@
-use crate::{GuardResult, RouterConfig, config::normalize_location, outlet::push_outlet};
+use crate::{GuardResult, RouterConfig, UrlError, config::normalize_location, outlet::push_outlet};
 use gpui::{
     App, AppContext, Context, Empty, Entity, Global, IntoElement, Render, SharedString, WeakEntity,
     Window, WindowId,
@@ -91,7 +91,11 @@ impl Router {
         cx.notify();
     }
 
-    pub fn url<K, V>(&self, name: &str, params: impl IntoIterator<Item = (K, V)>) -> String
+    pub fn url<K, V>(
+        &self,
+        name: &str,
+        params: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<String, UrlError>
     where
         K: Into<String>,
         V: Into<String>,
@@ -124,7 +128,7 @@ impl Router {
         cx: &App,
         name: &str,
         params: &[(String, String)],
-    ) -> Option<String> {
+    ) -> Option<Result<String, UrlError>> {
         window_router(window, cx).map(|router| router.read(cx).url(name, params.iter().cloned()))
     }
 }
@@ -163,7 +167,9 @@ impl Render for Router {
             match guard_result {
                 Some(GuardResult::Deny) => return Empty.into_any_element(),
                 Some(GuardResult::Redirect(redirect)) => {
-                    let path = self.config.resolve_redirect(&redirect);
+                    let Ok(path) = self.config.resolve_redirect(&redirect) else {
+                        return Empty.into_any_element();
+                    };
                     if self.location() == path || redirects_remaining == 0 {
                         return Empty.into_any_element();
                     }
@@ -838,7 +844,38 @@ mod tests {
             router.read_with(&visual, |router, _| {
                 router.url("login", [("from", "account")])
             }),
-            "/login?from=account"
+            Ok("/login?from=account".into())
+        );
+    }
+
+    #[gpui::test]
+    async fn invalid_named_redirects_do_not_panic(cx: &mut TestAppContext) {
+        let config = RouterConfig::new()
+            .route("/", || "home")
+            .route("/secret", || "secret")
+            .guard(|| crate::GuardResult::Redirect(crate::Redirect::named("missing")));
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        router.update(&mut visual, |router, cx| router.navigate("/secret", cx));
+        visual.update(|window, cx| {
+            router.update(cx, |router, cx| {
+                router.render(window, cx).into_any_element()
+            });
+        });
+
+        assert_eq!(
+            router.read_with(&visual, |router, _| router.location().to_owned()),
+            "/secret"
+        );
+        assert_eq!(
+            router.read_with(&visual, |router, _| {
+                router.url("missing", Vec::<(&str, &str)>::new())
+            }),
+            Err(crate::UrlError::UnknownName("missing".into()))
         );
     }
 

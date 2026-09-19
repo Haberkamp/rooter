@@ -1,5 +1,5 @@
 use gpui::{AnyElement, App, IntoElement, Window};
-use std::{ops::Range, rc::Rc};
+use std::{fmt, ops::Range, rc::Rc};
 
 pub(crate) type RouteFactory = Box<dyn Fn(RouteContext, &mut Window, &mut App) -> AnyElement>;
 pub(crate) type LayoutFactory = Rc<dyn Fn(RouteContext, &mut Window, &mut App) -> AnyElement>;
@@ -46,6 +46,28 @@ impl From<&str> for Redirect {
         }
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UrlError {
+    UnknownName(String),
+    MissingParameter { name: String, parameter: String },
+}
+
+impl fmt::Display for UrlError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownName(name) => write!(formatter, "unknown route name `{name}`"),
+            Self::MissingParameter { name, parameter } => {
+                write!(
+                    formatter,
+                    "missing parameter `{parameter}` for route `{name}`"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for UrlError {}
 
 impl From<String> for Redirect {
     fn from(path: String) -> Self {
@@ -470,7 +492,11 @@ impl RouterConfig {
         self
     }
 
-    pub fn url<K, V>(&self, name: &str, params: impl IntoIterator<Item = (K, V)>) -> String
+    pub fn url<K, V>(
+        &self,
+        name: &str,
+        params: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<String, UrlError>
     where
         K: Into<String>,
         V: Into<String>,
@@ -482,20 +508,24 @@ impl RouterConfig {
         self.generate_named_url(name, params)
     }
 
-    pub(crate) fn resolve_redirect(&self, redirect: &Redirect) -> String {
+    pub(crate) fn resolve_redirect(&self, redirect: &Redirect) -> Result<String, UrlError> {
         match &redirect.kind {
-            RedirectKind::Path(path) => normalize_location(path),
+            RedirectKind::Path(path) => Ok(normalize_location(path)),
             RedirectKind::Named(name) => self.generate_named_url(name, redirect.params.clone()),
         }
     }
 
-    fn generate_named_url(&self, name: &str, params: Vec<(String, String)>) -> String {
+    fn generate_named_url(
+        &self,
+        name: &str,
+        params: Vec<(String, String)>,
+    ) -> Result<String, UrlError> {
         let Some(route) = self
             .routes
             .iter()
             .find(|route| route.name.as_deref() == Some(name))
         else {
-            panic!("unknown route name `{name}`");
+            return Err(UrlError::UnknownName(name.to_owned()));
         };
         generate_url(&route.path, name, params)
     }
@@ -819,7 +849,11 @@ fn compile_constraint(constraint: ParamConstraint) -> Result<regex::Regex, regex
     regex::Regex::new(&format!("^(?:{pattern})$"))
 }
 
-fn generate_url(pattern: &str, name: &str, mut params: Vec<(String, String)>) -> String {
+fn generate_url(
+    pattern: &str,
+    name: &str,
+    mut params: Vec<(String, String)>,
+) -> Result<String, UrlError> {
     let mut segments = Vec::new();
     for segment in pattern.split('/').filter(|segment| !segment.is_empty()) {
         let Some(parameter) = segment
@@ -830,8 +864,11 @@ fn generate_url(pattern: &str, name: &str, mut params: Vec<(String, String)>) ->
             continue;
         };
         if let Some(parameter) = parameter.strip_prefix('*') {
-            let value = take_param(&mut params, parameter)
-                .unwrap_or_else(|| panic!("missing parameter `{parameter}` for route `{name}`"));
+            let value =
+                take_param(&mut params, parameter).ok_or_else(|| UrlError::MissingParameter {
+                    name: name.to_owned(),
+                    parameter: parameter.to_owned(),
+                })?;
             segments.extend(
                 value
                     .split('/')
@@ -843,8 +880,11 @@ fn generate_url(pattern: &str, name: &str, mut params: Vec<(String, String)>) ->
                 segments.push(value);
             }
         } else {
-            let value = take_param(&mut params, parameter)
-                .unwrap_or_else(|| panic!("missing parameter `{parameter}` for route `{name}`"));
+            let value =
+                take_param(&mut params, parameter).ok_or_else(|| UrlError::MissingParameter {
+                    name: name.to_owned(),
+                    parameter: parameter.to_owned(),
+                })?;
             segments.push(value);
         }
     }
@@ -853,11 +893,11 @@ fn generate_url(pattern: &str, name: &str, mut params: Vec<(String, String)>) ->
     } else {
         format!("/{}", segments.join("/"))
     };
-    if params.is_empty() {
+    Ok(if params.is_empty() {
         path
     } else {
         format!("{path}?{}", serialize_query(&params))
-    }
+    })
 }
 
 fn take_param(params: &mut Vec<(String, String)>, name: &str) -> Option<String> {
@@ -941,12 +981,20 @@ mod tests {
             .route("/login", || "login")
             .name("login");
 
-        assert_eq!(config.url("users.show", [("id", "42")]), "/users/42");
         assert_eq!(
-            config.url("users.show", [("id", "42"), ("tab", "profile")]),
+            config.url("users.show", [("id", "42")]).unwrap(),
+            "/users/42"
+        );
+        assert_eq!(
+            config
+                .url("users.show", [("id", "42"), ("tab", "profile")])
+                .unwrap(),
             "/users/42?tab=profile"
         );
-        assert_eq!(config.url("login", Vec::<(&str, &str)>::new()), "/login");
+        assert_eq!(
+            config.url("login", Vec::<(&str, &str)>::new()).unwrap(),
+            "/login"
+        );
     }
 
     #[test]
@@ -957,10 +1005,18 @@ mod tests {
             .route("/files/{*path}", || "file")
             .name("files.show");
 
-        assert_eq!(config.url("users", Vec::<(&str, &str)>::new()), "/users");
-        assert_eq!(config.url("users", [("name", "nils")]), "/users/nils");
         assert_eq!(
-            config.url("files.show", [("path", "documents/2026/report.pdf")]),
+            config.url("users", Vec::<(&str, &str)>::new()).unwrap(),
+            "/users"
+        );
+        assert_eq!(
+            config.url("users", [("name", "nils")]).unwrap(),
+            "/users/nils"
+        );
+        assert_eq!(
+            config
+                .url("files.show", [("path", "documents/2026/report.pdf")])
+                .unwrap(),
             "/files/documents/2026/report.pdf"
         );
     }
@@ -974,7 +1030,7 @@ mod tests {
         });
 
         assert_eq!(
-            config.url("dashboard.users.show", [("id", "7")]),
+            config.url("dashboard.users.show", [("id", "7")]).unwrap(),
             "/dashboard/users/7"
         );
     }
@@ -987,31 +1043,66 @@ mod tests {
             .route("/users/{id}", || "user")
             .name("users.show");
 
-        assert_eq!(config.resolve_redirect(&Redirect::named("login")), "/login");
         assert_eq!(
-            config.resolve_redirect(
-                &Redirect::named("users.show")
-                    .param("id", "42")
-                    .param("tab", "profile")
-            ),
+            config.resolve_redirect(&Redirect::named("login")).unwrap(),
+            "/login"
+        );
+        assert_eq!(
+            config
+                .resolve_redirect(
+                    &Redirect::named("users.show")
+                        .param("id", "42")
+                        .param("tab", "profile")
+                )
+                .unwrap(),
             "/users/42?tab=profile"
         );
-        assert_eq!(config.resolve_redirect(&"/account".into()), "/account");
+        assert_eq!(
+            config.resolve_redirect(&"/account".into()).unwrap(),
+            "/account"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "missing parameter `id` for route `users.show`")]
-    fn rejects_named_urls_with_missing_required_parameters() {
+    fn returns_err_for_named_urls_with_missing_required_parameters() {
         let config = RouterConfig::new()
             .route("/users/{id}", || "user")
             .name("users.show");
-        let _ = config.url("users.show", Vec::<(&str, &str)>::new());
+
+        assert_eq!(
+            config.url("users.show", Vec::<(&str, &str)>::new()),
+            Err(crate::UrlError::MissingParameter {
+                name: "users.show".into(),
+                parameter: "id".into(),
+            })
+        );
     }
 
     #[test]
-    #[should_panic(expected = "unknown route name `missing`")]
-    fn rejects_unknown_route_names() {
-        let _ = RouterConfig::new().url("missing", Vec::<(&str, &str)>::new());
+    fn returns_err_for_unknown_route_names() {
+        assert_eq!(
+            RouterConfig::new().url("missing", Vec::<(&str, &str)>::new()),
+            Err(crate::UrlError::UnknownName("missing".into()))
+        );
+    }
+
+    #[test]
+    fn returns_err_for_named_redirects_with_unknown_or_incomplete_routes() {
+        let config = RouterConfig::new()
+            .route("/users/{id}", || "user")
+            .name("users.show");
+
+        assert_eq!(
+            config.resolve_redirect(&Redirect::named("login")),
+            Err(crate::UrlError::UnknownName("login".into()))
+        );
+        assert_eq!(
+            config.resolve_redirect(&Redirect::named("users.show")),
+            Err(crate::UrlError::MissingParameter {
+                name: "users.show".into(),
+                parameter: "id".into(),
+            })
+        );
     }
 
     #[test]
