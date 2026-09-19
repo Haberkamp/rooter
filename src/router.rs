@@ -1,9 +1,24 @@
 use crate::{GuardResult, RouterConfig, UrlError, config::normalize_location, outlet::push_outlet};
 use gpui::{
-    App, AppContext, Context, Empty, Entity, Global, IntoElement, Render, SharedString, WeakEntity,
-    Window, WindowId,
+    App, AppContext, Context, Empty, Entity, EventEmitter, Global, IntoElement, Render,
+    SharedString, WeakEntity, Window, WindowId,
 };
 use std::collections::HashMap;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NavigationKind {
+    Push,
+    Replace,
+    Back,
+    Forward,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NavigationEvent {
+    pub from: String,
+    pub to: String,
+    pub kind: NavigationKind,
+}
 
 #[derive(Default)]
 struct WindowRouters(HashMap<WindowId, WeakEntity<Router>>);
@@ -15,6 +30,8 @@ pub struct Router {
     index: usize,
     config: RouterConfig,
 }
+
+impl EventEmitter<NavigationEvent> for Router {}
 
 impl Router {
     pub fn attach<T: 'static>(
@@ -60,9 +77,15 @@ impl Router {
         if self.location() == path {
             return;
         }
+        let from = self.location().to_owned();
         self.entries.truncate(self.index + 1);
-        self.entries.push(path.into());
+        self.entries.push(path.clone().into());
         self.index = self.entries.len() - 1;
+        cx.emit(NavigationEvent {
+            from,
+            to: path,
+            kind: NavigationKind::Push,
+        });
         cx.notify();
     }
 
@@ -71,7 +94,13 @@ impl Router {
         if self.location() == path {
             return;
         }
-        self.entries[self.index] = path.into();
+        let from = self.location().to_owned();
+        self.entries[self.index] = path.clone().into();
+        cx.emit(NavigationEvent {
+            from,
+            to: path,
+            kind: NavigationKind::Replace,
+        });
         cx.notify();
     }
 
@@ -79,7 +108,13 @@ impl Router {
         if !self.can_go_back() {
             return;
         }
+        let from = self.location().to_owned();
         self.index -= 1;
+        cx.emit(NavigationEvent {
+            from,
+            to: self.location().to_owned(),
+            kind: NavigationKind::Back,
+        });
         cx.notify();
     }
 
@@ -87,7 +122,13 @@ impl Router {
         if !self.can_go_forward() {
             return;
         }
+        let from = self.location().to_owned();
         self.index += 1;
+        cx.emit(NavigationEvent {
+            from,
+            to: self.location().to_owned(),
+            kind: NavigationKind::Forward,
+        });
         cx.notify();
     }
 
@@ -987,6 +1028,135 @@ mod tests {
         });
 
         assert_eq!(&order.lock().unwrap()[..3], ["page", "dashboard", "shell"]);
+    }
+
+    #[gpui::test]
+    async fn navigate_emits_a_push_event(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let router = router_for_window(&window, cx);
+        let events = collect_events(&router, cx);
+
+        router.update(cx, |router, cx| router.navigate("/about", cx));
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            [NavigationEvent {
+                from: "/".into(),
+                to: "/about".into(),
+                kind: NavigationKind::Push,
+            }]
+        );
+    }
+
+    #[gpui::test]
+    async fn replace_back_and_forward_emit_their_kinds(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let router = router_for_window(&window, cx);
+        let events = collect_events(&router, cx);
+
+        router.update(cx, |router, cx| router.navigate("/about", cx));
+        router.update(cx, |router, cx| router.replace("/login", cx));
+        router.update(cx, |router, cx| router.back(cx));
+        router.update(cx, |router, cx| router.forward(cx));
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                NavigationEvent {
+                    from: "/".into(),
+                    to: "/about".into(),
+                    kind: NavigationKind::Push,
+                },
+                NavigationEvent {
+                    from: "/about".into(),
+                    to: "/login".into(),
+                    kind: NavigationKind::Replace,
+                },
+                NavigationEvent {
+                    from: "/login".into(),
+                    to: "/".into(),
+                    kind: NavigationKind::Back,
+                },
+                NavigationEvent {
+                    from: "/".into(),
+                    to: "/login".into(),
+                    kind: NavigationKind::Forward,
+                },
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn noop_history_changes_do_not_emit_events(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let router = router_for_window(&window, cx);
+        let events = collect_events(&router, cx);
+
+        router.update(cx, |router, cx| router.navigate("/", cx));
+        router.update(cx, |router, cx| router.back(cx));
+        router.update(cx, |router, cx| router.forward(cx));
+
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    async fn guard_redirects_emit_a_replace_event(cx: &mut TestAppContext) {
+        let config = RouterConfig::new()
+            .route("/", || "home")
+            .route("/account", || "account")
+            .guard(|| crate::GuardResult::Redirect("/login".into()))
+            .route("/login", || "login");
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let events = collect_events(&router, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        router.update(&mut visual, |router, cx| router.navigate("/account", cx));
+        visual.update(|window, cx| {
+            router.update(cx, |router, cx| {
+                router.render(window, cx).into_any_element()
+            });
+        });
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                NavigationEvent {
+                    from: "/".into(),
+                    to: "/account".into(),
+                    kind: NavigationKind::Push,
+                },
+                NavigationEvent {
+                    from: "/account".into(),
+                    to: "/login".into(),
+                    kind: NavigationKind::Replace,
+                },
+            ]
+        );
+    }
+
+    fn collect_events(
+        router: &Entity<Router>,
+        cx: &mut TestAppContext,
+    ) -> Arc<Mutex<Vec<NavigationEvent>>> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        router.update(cx, |_, cx| {
+            let entity = cx.entity();
+            cx.subscribe(&entity, move |_, _, event: &NavigationEvent, _| {
+                captured.lock().unwrap().push(event.clone());
+            })
+            .detach();
+        });
+        events
     }
 
     fn router_for_window(
