@@ -11,8 +11,8 @@ struct WindowRouters(HashMap<WindowId, WeakEntity<Router>>);
 impl Global for WindowRouters {}
 
 pub struct Router {
-    location: SharedString,
-    #[allow(dead_code)]
+    entries: Vec<SharedString>,
+    index: usize,
     config: RouterConfig,
 }
 
@@ -22,8 +22,19 @@ impl Router {
         cx: &mut Context<T>,
         config: RouterConfig,
     ) -> Entity<Self> {
+        Self::attach_at(window, cx, config, "/")
+    }
+
+    pub fn attach_at<T: 'static>(
+        window: &mut Window,
+        cx: &mut Context<T>,
+        config: RouterConfig,
+        path: impl Into<SharedString>,
+    ) -> Entity<Self> {
+        let location: SharedString = normalize_path(path.into().as_ref()).into();
         let router = cx.new(|_| Self {
-            location: "/".into(),
+            entries: vec![location],
+            index: 0,
             config,
         });
         cx.default_global::<WindowRouters>()
@@ -33,33 +44,90 @@ impl Router {
     }
 
     pub fn location(&self) -> &str {
-        &self.location
+        &self.entries[self.index]
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        self.index > 0
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.index + 1 < self.entries.len()
     }
 
     pub fn navigate(&mut self, path: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.location = normalize_path(path.into().as_ref()).into();
+        let path = normalize_path(path.into().as_ref());
+        if self.location() == path {
+            return;
+        }
+        self.entries.truncate(self.index + 1);
+        self.entries.push(path.into());
+        self.index = self.entries.len() - 1;
+        cx.notify();
+    }
+
+    pub fn replace(&mut self, path: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let path = normalize_path(path.into().as_ref());
+        if self.location() == path {
+            return;
+        }
+        self.entries[self.index] = path.into();
+        cx.notify();
+    }
+
+    pub fn back(&mut self, cx: &mut Context<Self>) {
+        if !self.can_go_back() {
+            return;
+        }
+        self.index -= 1;
+        cx.notify();
+    }
+
+    pub fn forward(&mut self, cx: &mut Context<Self>) {
+        if !self.can_go_forward() {
+            return;
+        }
+        self.index += 1;
         cx.notify();
     }
 
     pub fn navigate_window(window: &Window, cx: &mut App, path: impl Into<SharedString>) -> bool {
-        let router = cx
-            .try_global::<WindowRouters>()
-            .and_then(|routers| routers.0.get(&window.window_handle().window_id()))
-            .and_then(WeakEntity::upgrade);
-        let Some(router) = router else {
-            return false;
-        };
-        let path = path.into();
-        router.update(cx, |router, cx| router.navigate(path, cx));
-        true
+        update_window_router(window, cx, |router, cx| router.navigate(path, cx))
+    }
+
+    pub fn replace_window(window: &Window, cx: &mut App, path: impl Into<SharedString>) -> bool {
+        update_window_router(window, cx, |router, cx| router.replace(path, cx))
+    }
+
+    pub fn back_window(window: &Window, cx: &mut App) -> bool {
+        update_window_router(window, cx, |router, cx| router.back(cx))
+    }
+
+    pub fn forward_window(window: &Window, cx: &mut App) -> bool {
+        update_window_router(window, cx, |router, cx| router.forward(cx))
     }
 
     pub(crate) fn window_location(window: &Window, cx: &App) -> Option<SharedString> {
-        cx.try_global::<WindowRouters>()
-            .and_then(|routers| routers.0.get(&window.window_handle().window_id()))
-            .and_then(WeakEntity::upgrade)
-            .map(|router| router.read(cx).location.clone())
+        window_router(window, cx).map(|router| router.read(cx).location().to_owned().into())
     }
+}
+
+fn window_router(window: &Window, cx: &App) -> Option<Entity<Router>> {
+    cx.try_global::<WindowRouters>()
+        .and_then(|routers| routers.0.get(&window.window_handle().window_id()))
+        .and_then(WeakEntity::upgrade)
+}
+
+fn update_window_router(
+    window: &Window,
+    cx: &mut App,
+    update: impl FnOnce(&mut Router, &mut Context<Router>),
+) -> bool {
+    let Some(router) = window_router(window, cx) else {
+        return false;
+    };
+    router.update(cx, update);
+    true
 }
 
 impl Render for Router {
@@ -67,7 +135,7 @@ impl Render for Router {
         let mut redirects_remaining = self.config.routes.len();
 
         loop {
-            let Some(matched) = self.config.match_route(&self.location) else {
+            let Some(matched) = self.config.match_route(self.location()) else {
                 return Empty.into_any_element();
             };
             let guard_result = self.config.routes[matched.index]
@@ -79,12 +147,11 @@ impl Render for Router {
                 Some(GuardResult::Deny) => return Empty.into_any_element(),
                 Some(GuardResult::Redirect(path)) => {
                     let path = normalize_path(&path);
-                    if self.location.as_ref() == path || redirects_remaining == 0 {
+                    if self.location() == path || redirects_remaining == 0 {
                         return Empty.into_any_element();
                     }
                     redirects_remaining -= 1;
-                    self.location = path.into();
-                    cx.notify();
+                    self.replace(path, cx);
                 }
                 Some(GuardResult::Allow) | None => {
                     return (self.config.routes[matched.index].factory)(
@@ -206,6 +273,235 @@ mod tests {
         assert_eq!(
             router.read_with(&visual, |router, _| router.location().to_owned()),
             "/about"
+        );
+    }
+
+    #[gpui::test]
+    async fn attach_at_starts_on_the_given_path(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach_at(window, cx, config(), "/about"),
+        });
+        let router = router_for_window(&window, cx);
+
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/about"
+        );
+        assert!(!router.read_with(cx, |router, _| router.can_go_back()));
+        assert!(!router.read_with(cx, |router, _| router.can_go_forward()));
+    }
+
+    #[gpui::test]
+    async fn navigate_pushes_history_and_back_returns_to_the_previous_path(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let router = router_for_window(&window, cx);
+
+        router.update(cx, |router, cx| router.navigate("/about", cx));
+        router.update(cx, |router, cx| router.navigate("/dashboard/settings", cx));
+
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/dashboard/settings"
+        );
+        assert!(router.read_with(cx, |router, _| router.can_go_back()));
+        assert!(!router.read_with(cx, |router, _| router.can_go_forward()));
+
+        router.update(cx, |router, cx| router.back(cx));
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/about"
+        );
+        assert!(router.read_with(cx, |router, _| router.can_go_back()));
+        assert!(router.read_with(cx, |router, _| router.can_go_forward()));
+
+        router.update(cx, |router, cx| router.back(cx));
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/"
+        );
+        assert!(!router.read_with(cx, |router, _| router.can_go_back()));
+        assert!(router.read_with(cx, |router, _| router.can_go_forward()));
+    }
+
+    #[gpui::test]
+    async fn forward_restores_the_path_after_back(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let router = router_for_window(&window, cx);
+
+        router.update(cx, |router, cx| router.navigate("/about", cx));
+        router.update(cx, |router, cx| router.back(cx));
+        router.update(cx, |router, cx| router.forward(cx));
+
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/about"
+        );
+        assert!(router.read_with(cx, |router, _| router.can_go_back()));
+        assert!(!router.read_with(cx, |router, _| router.can_go_forward()));
+    }
+
+    #[gpui::test]
+    async fn back_and_forward_are_noops_at_the_ends_of_history(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let router = router_for_window(&window, cx);
+
+        router.update(cx, |router, cx| router.back(cx));
+        router.update(cx, |router, cx| router.forward(cx));
+
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/"
+        );
+        assert!(!router.read_with(cx, |router, _| router.can_go_back()));
+        assert!(!router.read_with(cx, |router, _| router.can_go_forward()));
+    }
+
+    #[gpui::test]
+    async fn navigating_to_the_current_path_does_not_push_history(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let router = router_for_window(&window, cx);
+
+        router.update(cx, |router, cx| router.navigate("/about", cx));
+        router.update(cx, |router, cx| router.navigate("/about/", cx));
+
+        assert!(router.read_with(cx, |router, _| router.can_go_back()));
+        router.update(cx, |router, cx| router.back(cx));
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/"
+        );
+        router.update(cx, |router, cx| router.forward(cx));
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/about"
+        );
+        assert!(!router.read_with(cx, |router, _| router.can_go_forward()));
+    }
+
+    #[gpui::test]
+    async fn replace_updates_the_current_entry_without_pushing(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let router = router_for_window(&window, cx);
+
+        router.update(cx, |router, cx| router.replace("/about", cx));
+
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/about"
+        );
+        assert!(!router.read_with(cx, |router, _| router.can_go_back()));
+        assert!(!router.read_with(cx, |router, _| router.can_go_forward()));
+    }
+
+    #[gpui::test]
+    async fn navigating_after_back_discards_the_forward_stack(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let router = router_for_window(&window, cx);
+
+        router.update(cx, |router, cx| router.navigate("/about", cx));
+        router.update(cx, |router, cx| router.navigate("/missing", cx));
+        router.update(cx, |router, cx| router.back(cx));
+        router.update(cx, |router, cx| router.navigate("/login", cx));
+
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/login"
+        );
+        assert!(!router.read_with(cx, |router, _| router.can_go_forward()));
+
+        router.update(cx, |router, cx| router.back(cx));
+        assert_eq!(
+            router.read_with(cx, |router, _| router.location().to_owned()),
+            "/about"
+        );
+    }
+
+    #[gpui::test]
+    async fn redirecting_guards_replace_the_attempted_location(cx: &mut TestAppContext) {
+        let config = RouterConfig::new()
+            .route("/", || "home")
+            .route("/account", || "account")
+            .guard(|_, _| crate::GuardResult::Redirect("/login".to_owned()))
+            .route("/login", || "login");
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        router.update(&mut visual, |router, cx| router.navigate("/account", cx));
+        visual.update(|window, cx| {
+            router.update(cx, |router, cx| {
+                router.render(window, cx).into_any_element()
+            });
+        });
+
+        assert_eq!(
+            router.read_with(&visual, |router, _| router.location().to_owned()),
+            "/login"
+        );
+        assert!(router.read_with(&visual, |router, _| router.can_go_back()));
+        assert!(!router.read_with(&visual, |router, _| router.can_go_forward()));
+
+        router.update(&mut visual, |router, cx| router.back(cx));
+        assert_eq!(
+            router.read_with(&visual, |router, _| router.location().to_owned()),
+            "/"
+        );
+        router.update(&mut visual, |router, cx| router.forward(cx));
+        assert_eq!(
+            router.read_with(&visual, |router, _| router.location().to_owned()),
+            "/login"
+        );
+    }
+
+    #[gpui::test]
+    async fn window_history_helpers_resolve_the_attached_router(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config()),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        assert!(visual.update(|window, cx| Router::navigate_window(window, cx, "/about")));
+        assert_eq!(
+            router.read_with(&visual, |router, _| router.location().to_owned()),
+            "/about"
+        );
+        assert!(visual.update(|window, cx| Router::back_window(window, cx)));
+        assert_eq!(
+            router.read_with(&visual, |router, _| router.location().to_owned()),
+            "/"
+        );
+        assert!(visual.update(|window, cx| Router::forward_window(window, cx)));
+        assert_eq!(
+            router.read_with(&visual, |router, _| router.location().to_owned()),
+            "/about"
+        );
+        assert!(visual.update(|window, cx| Router::replace_window(window, cx, "/login")));
+        assert_eq!(
+            router.read_with(&visual, |router, _| router.location().to_owned()),
+            "/login"
+        );
+        assert!(router.read_with(&visual, |router, _| router.can_go_back()));
+        visual.update(|window, cx| Router::back_window(window, cx));
+        assert_eq!(
+            router.read_with(&visual, |router, _| router.location().to_owned()),
+            "/"
         );
     }
 
