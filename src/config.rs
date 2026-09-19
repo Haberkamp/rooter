@@ -1,6 +1,15 @@
 use gpui::{AnyElement, App, IntoElement, Window};
+use std::{ops::Range, rc::Rc};
 
 pub(crate) type RouteFactory = Box<dyn Fn(&mut Window, &mut App) -> AnyElement>;
+pub(crate) type RouteGuard = Rc<dyn Fn(&mut Window, &mut App) -> GuardResult>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GuardResult {
+    Allow,
+    Deny,
+    Redirect(String),
+}
 
 pub trait PageFactory: 'static {
     #[doc(hidden)]
@@ -40,6 +49,7 @@ where
 pub(crate) struct RouteEntry {
     pub(crate) path: String,
     pub(crate) factory: RouteFactory,
+    pub(crate) guards: Vec<RouteGuard>,
     matcher: matchit::Router<()>,
     is_catch_all: bool,
 }
@@ -60,6 +70,12 @@ pub struct RouterConfig {
     pub(crate) routes: Vec<RouteEntry>,
     prefix: String,
     is_group: bool,
+    last_registration: Option<LastRegistration>,
+}
+
+enum LastRegistration {
+    Route(usize),
+    Group(Range<usize>),
 }
 
 impl RouterConfig {
@@ -68,6 +84,7 @@ impl RouterConfig {
             routes: Vec::new(),
             prefix: "/".to_owned(),
             is_group: false,
+            last_registration: None,
         }
     }
 
@@ -128,15 +145,44 @@ impl RouterConfig {
             routes: Vec::new(),
             prefix,
             is_group: true,
+            last_registration: None,
         });
 
+        let start = self.routes.len();
         for route in child.routes {
-            self.insert(route.path.clone(), route.path, route.factory);
+            self.insert_with_guards(route.path.clone(), route.path, route.factory, route.guards);
+        }
+        self.last_registration = Some(LastRegistration::Group(start..self.routes.len()));
+        self
+    }
+
+    pub fn guard(mut self, guard: impl Fn(&mut Window, &mut App) -> GuardResult + 'static) -> Self {
+        let guard: RouteGuard = Rc::new(guard);
+        match self.last_registration.as_ref() {
+            Some(LastRegistration::Route(index)) => {
+                self.routes[*index].guards.push(guard);
+            }
+            Some(LastRegistration::Group(range)) => {
+                for route in &mut self.routes[range.clone()] {
+                    route.guards.insert(0, guard.clone());
+                }
+            }
+            None => panic!("a guard must follow a route or group"),
         }
         self
     }
 
     fn insert(&mut self, path: String, original_path: String, factory: RouteFactory) {
+        self.insert_with_guards(path, original_path, factory, Vec::new());
+    }
+
+    fn insert_with_guards(
+        &mut self,
+        path: String,
+        original_path: String,
+        factory: RouteFactory,
+        guards: Vec<RouteGuard>,
+    ) {
         if self.routes.iter().any(|route| route.path == path) {
             panic!(
                 "duplicate route `{path}`: `{original_path}` normalizes to an already registered path"
@@ -149,12 +195,15 @@ impl RouterConfig {
         let is_catch_all = path
             .split('/')
             .any(|segment| segment.starts_with("{*") && segment.ends_with('}'));
+        let index = self.routes.len();
         self.routes.push(RouteEntry {
             path,
             factory,
+            guards,
             matcher,
             is_catch_all,
         });
+        self.last_registration = Some(LastRegistration::Route(index));
     }
 
     pub(crate) fn match_index(&self, path: &str) -> Option<usize> {
@@ -192,7 +241,42 @@ impl Default for RouterConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{RouterConfig, normalize_path, with_context};
+    use super::{GuardResult, RouterConfig, normalize_path, with_context};
+
+    #[test]
+    fn attaches_a_guard_to_the_previous_route() {
+        let config = RouterConfig::new()
+            .route("/", || "home")
+            .guard(|_, _| GuardResult::Allow)
+            .route("/public", || "public");
+
+        assert_eq!(config.routes[0].guards.len(), 1);
+        assert!(config.routes[1].guards.is_empty());
+    }
+
+    #[test]
+    fn attaches_a_guard_to_every_route_in_the_previous_group() {
+        let config = RouterConfig::new()
+            .group("/admin", |routes| {
+                routes
+                    .index(|| "dashboard")
+                    .route("users", || "users")
+                    .group("settings", |routes| routes.index(|| "settings"))
+            })
+            .guard(|_, _| GuardResult::Allow)
+            .route("/login", || "login");
+
+        assert_eq!(config.routes[0].guards.len(), 1);
+        assert_eq!(config.routes[1].guards.len(), 1);
+        assert_eq!(config.routes[2].guards.len(), 1);
+        assert!(config.routes[3].guards.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "a guard must follow a route or group")]
+    fn rejects_a_guard_without_a_previous_route_or_group() {
+        let _ = RouterConfig::new().guard(|_, _| GuardResult::Allow);
+    }
 
     #[test]
     fn accepts_context_free_and_context_aware_page_factories() {
