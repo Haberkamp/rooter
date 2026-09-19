@@ -254,6 +254,34 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn catch_all_parameters_are_passed_to_the_page_factory(cx: &mut TestAppContext) {
+        let captured_path = Arc::new(Mutex::new(None));
+        let page_path = captured_path.clone();
+        let config =
+            RouterConfig::new().route("/files/{*path}", move |route: crate::RouteContext| {
+                *page_path.lock().unwrap() = route.param("path").map(str::to_owned);
+                "file"
+            });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        router.update(&mut visual, |router, cx| {
+            router.navigate("/files/documents/2026/report.pdf", cx)
+        });
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router
+        });
+
+        assert_eq!(
+            captured_path.lock().unwrap().as_deref(),
+            Some("documents/2026/report.pdf")
+        );
+    }
+
+    #[gpui::test]
     async fn denied_routes_do_not_render_the_page_factory(cx: &mut TestAppContext) {
         let renders = Arc::new(AtomicUsize::new(0));
         let page_renders = renders.clone();

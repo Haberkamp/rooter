@@ -325,6 +325,41 @@ mod tests {
     }
 
     #[test]
+    fn extracts_the_full_catch_all_parameter() {
+        let config = RouterConfig::new().route("/files/{*path}", || "file");
+
+        let matched = config
+            .match_route("/files/documents/2026/report.pdf")
+            .unwrap();
+
+        assert_eq!(
+            matched.context.param("path"),
+            Some("documents/2026/report.pdf")
+        );
+    }
+
+    #[test]
+    fn exposes_parameters_from_the_deferred_catch_all_match() {
+        let config = RouterConfig::new()
+            .route("/files/{*path}", || "fallback")
+            .route("/files/{name}", || "file");
+
+        let specific = config.match_route("/files/report.pdf").unwrap();
+        let fallback = config
+            .match_route("/files/documents/2026/report.pdf")
+            .unwrap();
+
+        assert_eq!(specific.index, 1);
+        assert_eq!(specific.context.param("name"), Some("report.pdf"));
+        assert_eq!(specific.context.param("path"), None);
+        assert_eq!(fallback.index, 0);
+        assert_eq!(
+            fallback.context.param("path"),
+            Some("documents/2026/report.pdf")
+        );
+    }
+
+    #[test]
     fn accepts_route_aware_page_factories() {
         fn user_page(route: super::RouteContext) -> String {
             route.path().to_owned()
