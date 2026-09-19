@@ -11,6 +11,29 @@ pub enum GuardResult {
     Redirect(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParamConstraint {
+    Number,
+    Alpha,
+    AlphaNumeric,
+    Uuid,
+    Ulid,
+    In(Vec<String>),
+    Regex(String),
+}
+
+impl From<&str> for ParamConstraint {
+    fn from(pattern: &str) -> Self {
+        Self::Regex(pattern.to_owned())
+    }
+}
+
+impl From<String> for ParamConstraint {
+    fn from(pattern: String) -> Self {
+        Self::Regex(pattern)
+    }
+}
+
 #[doc(hidden)]
 pub struct WithoutContext;
 #[doc(hidden)]
@@ -93,8 +116,14 @@ pub(crate) struct RouteEntry {
     pub(crate) path: String,
     pub(crate) factory: RouteFactory,
     pub(crate) guards: Vec<RouteGuard>,
+    constraints: Vec<CompiledParamConstraint>,
     matcher: matchit::Router<()>,
     is_catch_all: bool,
+}
+
+struct CompiledParamConstraint {
+    parameter: String,
+    regex: regex::Regex,
 }
 
 pub(crate) fn normalize_path(path: &str) -> String {
@@ -199,7 +228,13 @@ impl RouterConfig {
 
         let start = self.routes.len();
         for route in child.routes {
-            self.insert_with_guards(route.path.clone(), route.path, route.factory, route.guards);
+            self.insert_entry(
+                route.path.clone(),
+                route.path,
+                route.factory,
+                route.guards,
+                route.constraints,
+            );
         }
         self.last_registration = Some(LastRegistration::Group(start..self.routes.len()));
         self
@@ -221,16 +256,49 @@ impl RouterConfig {
         self
     }
 
-    fn insert(&mut self, path: String, original_path: String, factory: RouteFactory) {
-        self.insert_with_guards(path, original_path, factory, Vec::new());
+    pub fn where_param(
+        mut self,
+        parameter: impl Into<String>,
+        constraint: impl Into<ParamConstraint>,
+    ) -> Self {
+        let parameter = parameter.into();
+        let index = match self.last_registration.as_ref() {
+            Some(LastRegistration::Route(index)) => *index,
+            Some(LastRegistration::Group(_)) => {
+                panic!("parameter constraints cannot be applied to a group")
+            }
+            None => panic!("a parameter constraint must follow a route"),
+        };
+        let route = &mut self.routes[index];
+        if !route_parameter_names(&route.path).any(|name| name == parameter) {
+            panic!(
+                "route `{}` has no parameter named `{parameter}`",
+                route.path
+            );
+        }
+        let regex = compile_constraint(constraint.into()).unwrap_or_else(|error| {
+            panic!(
+                "invalid constraint for parameter `{parameter}` on route `{}`: {error}",
+                route.path
+            )
+        });
+        route
+            .constraints
+            .push(CompiledParamConstraint { parameter, regex });
+        self
     }
 
-    fn insert_with_guards(
+    fn insert(&mut self, path: String, original_path: String, factory: RouteFactory) {
+        self.insert_entry(path, original_path, factory, Vec::new(), Vec::new());
+    }
+
+    fn insert_entry(
         &mut self,
         path: String,
         original_path: String,
         factory: RouteFactory,
         guards: Vec<RouteGuard>,
+        constraints: Vec<CompiledParamConstraint>,
     ) {
         if self.routes.iter().any(|route| route.path == path) {
             panic!(
@@ -249,6 +317,7 @@ impl RouterConfig {
             path,
             factory,
             guards,
+            constraints,
             matcher,
             is_catch_all,
         });
@@ -284,6 +353,14 @@ impl RouterConfig {
 
 fn matched_route(index: usize, route: &RouteEntry, path: &str) -> Option<MatchedRoute> {
     let matched = route.matcher.at(path).ok()?;
+    if route.constraints.iter().any(|constraint| {
+        matched
+            .params
+            .get(&constraint.parameter)
+            .is_none_or(|value| !constraint.regex.is_match(value))
+    }) {
+        return None;
+    }
     let params = matched
         .params
         .iter()
@@ -298,6 +375,35 @@ fn matched_route(index: usize, route: &RouteEntry, path: &str) -> Option<Matched
     })
 }
 
+fn route_parameter_names(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/').filter_map(|segment| {
+        segment
+            .strip_prefix('{')
+            .and_then(|segment| segment.strip_suffix('}'))
+            .map(|parameter| parameter.strip_prefix('*').unwrap_or(parameter))
+    })
+}
+
+fn compile_constraint(constraint: ParamConstraint) -> Result<regex::Regex, regex::Error> {
+    let pattern = match constraint {
+        ParamConstraint::Number => "[0-9]+".to_owned(),
+        ParamConstraint::Alpha => "[a-zA-Z]+".to_owned(),
+        ParamConstraint::AlphaNumeric => "[a-zA-Z0-9]+".to_owned(),
+        ParamConstraint::Uuid => {
+            "(?i:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})"
+                .to_owned()
+        }
+        ParamConstraint::Ulid => "(?i:[0-7][0-9a-hjkmnp-tv-z]{25})".to_owned(),
+        ParamConstraint::In(values) => values
+            .iter()
+            .map(|value| regex::escape(value))
+            .collect::<Vec<_>>()
+            .join("|"),
+        ParamConstraint::Regex(pattern) => pattern,
+    };
+    regex::Regex::new(&format!("^(?:{pattern})$"))
+}
+
 fn join_paths(prefix: &str, path: &str) -> String {
     normalize_path(&format!("{prefix}/{path}"))
 }
@@ -310,7 +416,106 @@ impl Default for RouterConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{GuardResult, RouterConfig, normalize_path};
+    use super::{GuardResult, ParamConstraint, RouterConfig, normalize_path};
+
+    #[test]
+    fn supports_builtin_parameter_constraints() {
+        let config = RouterConfig::new()
+            .route("/numbers/{value}", || "number")
+            .where_param("value", ParamConstraint::Number)
+            .route("/alpha/{value}", || "alpha")
+            .where_param("value", ParamConstraint::Alpha)
+            .route("/alpha-numeric/{value}", || "alpha numeric")
+            .where_param("value", ParamConstraint::AlphaNumeric)
+            .route("/uuids/{value}", || "uuid")
+            .where_param("value", ParamConstraint::Uuid)
+            .route("/ulids/{value}", || "ulid")
+            .where_param("value", ParamConstraint::Ulid)
+            .route("/status/{value}", || "status")
+            .where_param(
+                "value",
+                ParamConstraint::In(vec!["draft".to_owned(), "published".to_owned()]),
+            );
+
+        assert!(config.match_route("/numbers/42").is_some());
+        assert!(config.match_route("/numbers/forty-two").is_none());
+        assert!(config.match_route("/alpha/Rooter").is_some());
+        assert!(config.match_route("/alpha/Rooter2").is_none());
+        assert!(config.match_route("/alpha-numeric/Rooter2").is_some());
+        assert!(config.match_route("/alpha-numeric/rooter-2").is_none());
+        assert!(
+            config
+                .match_route("/uuids/550e8400-e29b-41d4-a716-446655440000")
+                .is_some()
+        );
+        assert!(config.match_route("/uuids/not-a-uuid").is_none());
+        assert!(
+            config
+                .match_route("/ulids/01ARZ3NDEKTSV4RRFFQ69G5FAV")
+                .is_some()
+        );
+        assert!(config.match_route("/ulids/not-a-ulid").is_none());
+        assert!(config.match_route("/status/draft").is_some());
+        assert!(config.match_route("/status/archived").is_none());
+    }
+
+    #[test]
+    fn supports_custom_regex_and_multiple_constraints() {
+        let config = RouterConfig::new()
+            .route("/posts/{year}/{slug}", || "post")
+            .where_param("year", ParamConstraint::Number)
+            .where_param("slug", "[a-z0-9-]+");
+
+        assert!(config.match_route("/posts/2026/rooter-1").is_some());
+        assert!(config.match_route("/posts/year/rooter-1").is_none());
+        assert!(config.match_route("/posts/2026/Rooter").is_none());
+    }
+
+    #[test]
+    fn constraints_preserve_declaration_order_and_catch_all_deferral() {
+        let config = RouterConfig::new()
+            .route("/files/{*path}", || "pdf")
+            .where_param("path", r".+\.pdf")
+            .route("/files/{name}", || "named")
+            .where_param("name", "[a-z]+");
+
+        assert_eq!(config.matched_path("/files/readme"), Some("/files/{name}"));
+        assert_eq!(
+            config.matched_path("/files/reports/2026.pdf"),
+            Some("/files/{*path}")
+        );
+        assert_eq!(config.matched_path("/files/reports/2026.txt"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "route `/users/{id}` has no parameter named `missing`")]
+    fn rejects_constraints_for_unknown_parameters() {
+        let _ = RouterConfig::new()
+            .route("/users/{id}", || "user")
+            .where_param("missing", ParamConstraint::Number);
+    }
+
+    #[test]
+    #[should_panic(expected = "a parameter constraint must follow a route")]
+    fn rejects_constraints_without_a_previous_route() {
+        let _ = RouterConfig::new().where_param("id", ParamConstraint::Number);
+    }
+
+    #[test]
+    #[should_panic(expected = "parameter constraints cannot be applied to a group")]
+    fn rejects_constraints_on_groups() {
+        let _ = RouterConfig::new()
+            .group("/users", |routes| routes.route("{id}", || "user"))
+            .where_param("id", ParamConstraint::Number);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid constraint for parameter `slug` on route `/posts/{slug}`")]
+    fn rejects_invalid_custom_regex_at_registration() {
+        let _ = RouterConfig::new()
+            .route("/posts/{slug}", || "post")
+            .where_param("slug", "[");
+    }
 
     #[test]
     fn extracts_required_route_parameters() {
