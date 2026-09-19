@@ -3,7 +3,7 @@ use gpui::{
     App, AppContext, Application, BorrowAppContext, Context, Entity, Global, Window, WindowOptions,
     div,
 };
-use rooter::{GuardResult, NavLink, RouteContext, Router, RouterConfig};
+use rooter::{GuardResult, NavLink, Redirect, RouteContext, Router, RouterConfig};
 
 #[derive(Default)]
 struct AuthState {
@@ -16,7 +16,7 @@ fn authenticated(_window: &mut Window, cx: &mut App) -> GuardResult {
     if cx.global::<AuthState>().logged_in {
         GuardResult::Allow
     } else {
-        GuardResult::Redirect("/login".to_owned())
+        GuardResult::Redirect(Redirect::named("login"))
     }
 }
 
@@ -24,7 +24,7 @@ fn owns_account(route: RouteContext) -> GuardResult {
     if route.param("id") == Some("42") {
         GuardResult::Allow
     } else {
-        GuardResult::Redirect("/account".to_owned())
+        GuardResult::Redirect(Redirect::named("account"))
     }
 }
 
@@ -36,13 +36,16 @@ fn routes() -> RouterConfig {
         .route("/login", || {
             div().child("You must log in before viewing the protected page.")
         })
+        .name("login")
         .route("/account", || {
             div().child("You are logged in, so the account guard allowed this page.")
         })
+        .name("account")
         .guard(authenticated)
         .route("/users/{id}", || {
             div().child("This page is only allowed for user 42.")
         })
+        .name("users.show")
         .guard(authenticated)
         .guard(owns_account)
 }
@@ -82,17 +85,19 @@ impl Render for AppView {
                             .child("Home"),
                     )
                     .child(
-                        NavLink::to("/account")
+                        NavLink::named("account")
                             .when_active(None, |link| link.underline())
                             .child("Protected account"),
                     )
                     .child(
-                        NavLink::to("/users/42")
+                        NavLink::named("users.show")
+                            .param("id", "42")
                             .when_active(None, |link| link.underline())
                             .child("User 42"),
                     )
                     .child(
-                        NavLink::to("/users/7")
+                        NavLink::named("users.show")
+                            .param("id", "7")
                             .when_active(None, |link| link.underline())
                             .child("User 7"),
                     ),

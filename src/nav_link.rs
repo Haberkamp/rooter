@@ -13,9 +13,18 @@ pub enum ActiveMatch {
     Partial,
 }
 
+#[derive(Clone, Debug)]
+enum NavTarget {
+    Path(SharedString),
+    Named {
+        name: SharedString,
+        params: Vec<(String, String)>,
+    },
+}
+
 #[derive(IntoElement)]
 pub struct NavLink {
-    to: SharedString,
+    to: NavTarget,
     children: Vec<AnyElement>,
     match_mode: ActiveMatch,
     when_active: Option<ActiveStyle>,
@@ -24,11 +33,32 @@ pub struct NavLink {
 impl NavLink {
     pub fn to(to: impl Into<SharedString>) -> Self {
         Self {
-            to: to.into(),
+            to: NavTarget::Path(to.into()),
             children: Vec::new(),
             match_mode: ActiveMatch::Exact,
             when_active: None,
         }
+    }
+
+    pub fn named(name: impl Into<SharedString>) -> Self {
+        Self {
+            to: NavTarget::Named {
+                name: name.into(),
+                params: Vec::new(),
+            },
+            children: Vec::new(),
+            match_mode: ActiveMatch::Exact,
+            when_active: None,
+        }
+    }
+
+    pub fn param(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        if let NavTarget::Named { params, .. } = &mut self.to {
+            params.push((key.into(), value.into()));
+        } else {
+            panic!("NavLink::param can only be used with NavLink::named");
+        }
+        self
     }
 
     pub fn when_active(
@@ -50,7 +80,7 @@ impl ParentElement for NavLink {
 
 impl RenderOnce for NavLink {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let to = self.to;
+        let to = resolve_target(&self.to, window, cx);
         let active = Router::window_location(window, cx).is_some_and(|location| {
             location_matches(location.as_ref(), to.as_ref(), self.match_mode)
         });
@@ -64,6 +94,15 @@ impl RenderOnce for NavLink {
             link = when_active(link);
         }
         link
+    }
+}
+
+fn resolve_target(target: &NavTarget, window: &Window, cx: &App) -> SharedString {
+    match target {
+        NavTarget::Path(path) => path.clone(),
+        NavTarget::Named { name, params } => Router::window_url(window, cx, name, params)
+            .unwrap_or_else(|| panic!("unknown route name `{name}`"))
+            .into(),
     }
 }
 
@@ -238,5 +277,45 @@ mod tests {
         });
 
         assert!(dashboard_active.load(Ordering::SeqCst));
+    }
+
+    #[gpui::test]
+    async fn named_links_resolve_to_generated_paths(cx: &mut TestAppContext) {
+        let user_active = Arc::new(AtomicBool::new(false));
+        let config = RouterConfig::new()
+            .route("/", || "home")
+            .route("/users/{id}", || "user")
+            .name("users.show");
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = window
+            .root(cx)
+            .unwrap()
+            .read_with(cx, |root, _| root.router.clone());
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        router.update(&mut visual, |router, cx| {
+            let path = router.url("users.show", [("id", "42"), ("tab", "profile")]);
+            router.navigate(path, cx);
+        });
+        visual.draw(point(px(0.), px(0.)), size(px(200.), px(40.)), |_, _| {
+            let user = user_active.clone();
+            div().child(
+                NavLink::named("users.show")
+                    .param("id", "42")
+                    .param("tab", "profile")
+                    .when_active(None, move |link| {
+                        user.store(true, Ordering::SeqCst);
+                        link
+                    }),
+            )
+        });
+
+        assert!(user_active.load(Ordering::SeqCst));
+        assert_eq!(
+            router.read_with(&visual, |router, _| router.location().to_owned()),
+            "/users/42?tab=profile"
+        );
     }
 }
