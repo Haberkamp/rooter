@@ -9,6 +9,11 @@ version.
 
 ## [Unreleased]
 
+### Added
+
+- Route loaders, `Resource` loading state, prefetch (default 30s TTL), and
+  `Invalidate` (`all` / `path` / `named`). See `examples/prefetch.rs`.
+
 ## [0.1.0] - 2026-09-19
 
 ### Changed

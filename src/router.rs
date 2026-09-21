@@ -1,9 +1,14 @@
-use crate::{GuardResult, RouterConfig, UrlError, config::normalize_location, outlet::push_outlet};
+use crate::{
+    GuardResult, Invalidate, RouterConfig, UrlError, config::normalize_location,
+    outlet::push_outlet, resource::DEFAULT_CACHE_FOR, resource::IntoCacheFor,
+    resource::InvalidateKind, resource::StoredResource,
+};
 use gpui::{
     App, AppContext, Context, Empty, Entity, EventEmitter, Global, IntoElement, Render,
     SharedString, WeakEntity, Window, WindowId,
 };
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// How the current location was reached.
 ///
@@ -37,6 +42,13 @@ pub struct Router {
     entries: Vec<SharedString>,
     index: usize,
     config: RouterConfig,
+    resources: HashMap<String, ResourceEntry>,
+    next_resource_generation: u64,
+}
+
+struct ResourceEntry {
+    generation: u64,
+    resource: StoredResource,
 }
 
 impl EventEmitter<NavigationEvent> for Router {}
@@ -61,6 +73,8 @@ impl Router {
             entries: vec![location],
             index: 0,
             config,
+            resources: HashMap::new(),
+            next_resource_generation: 0,
         });
         cx.default_global::<WindowRouters>()
             .0
@@ -170,6 +184,158 @@ impl Router {
         self.config.url(name, params)
     }
 
+    /// Start the matched route loader for `path` if it is not already running
+    /// or still fresh.
+    ///
+    /// `cache_for` is a [`Duration`] or [`None`] ([`DEFAULT_CACHE_FOR`]).
+    /// Does not change history. Navigation still proceeds even if the loader
+    /// has not finished.
+    pub fn prefetch(
+        &mut self,
+        path: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        cache_for: impl IntoCacheFor,
+    ) {
+        let path = normalize_location(path.into().as_ref());
+        self.ensure_resource(&path, cache_for.into_cache_for(), window, cx);
+    }
+
+    /// Prefetch using the router attached to `window`.
+    ///
+    /// `cache_for` is a [`Duration`] or [`None`] ([`DEFAULT_CACHE_FOR`]).
+    /// Returns `false` when this window has no router.
+    pub fn prefetch_window(
+        window: &mut Window,
+        cx: &mut App,
+        path: impl Into<SharedString>,
+        cache_for: impl IntoCacheFor,
+    ) -> bool {
+        let Some(router) = window_router(window, cx) else {
+            return false;
+        };
+        let path = path.into();
+        let cache_for = cache_for.into_cache_for();
+        router.update(cx, |router, cx| {
+            router.prefetch(path, window, cx, cache_for)
+        });
+        true
+    }
+
+    /// Drop cached route resources.
+    ///
+    /// [`Invalidate::all`] drops every cached resource. [`Invalidate::path`]
+    /// drops that location. [`Invalidate::named`] with params generates the
+    /// URL. A named route without required params drops every cached location
+    /// for that route. Unknown names are no-ops.
+    ///
+    /// In-flight loaders still finish, but discarded slots ignore their
+    /// results. The current page starts a new load on the next render.
+    pub fn invalidate(&mut self, target: Invalidate, cx: &mut Context<Self>) {
+        match target.kind() {
+            InvalidateKind::All => self.resources.clear(),
+            InvalidateKind::Path(_) | InvalidateKind::Named(_) => {
+                for key in self.invalidate_keys(&target) {
+                    self.resources.remove(&key);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// [`invalidate`](Self::invalidate) using the router attached to `window`.
+    ///
+    /// Returns `false` when this window has no router.
+    pub fn invalidate_window(window: &Window, cx: &mut App, target: Invalidate) -> bool {
+        update_window_router(window, cx, |router, cx| router.invalidate(target, cx))
+    }
+
+    fn invalidate_keys(&self, target: &Invalidate) -> Vec<String> {
+        match target.kind() {
+            InvalidateKind::All => Vec::new(),
+            InvalidateKind::Path(path) => vec![normalize_location(path)],
+            InvalidateKind::Named(name) => {
+                match self.config.url(name, target.params().iter().cloned()) {
+                    Ok(path) => vec![path],
+                    Err(UrlError::UnknownName(_)) => Vec::new(),
+                    Err(UrlError::MissingParameter { .. }) => {
+                        let Some(index) = self.config.named_route_index(name) else {
+                            return Vec::new();
+                        };
+                        self.resources
+                            .keys()
+                            .filter(|location| {
+                                self.config
+                                    .match_route(location)
+                                    .is_some_and(|matched| matched.index == index)
+                            })
+                            .cloned()
+                            .collect()
+                    }
+                }
+            }
+        }
+    }
+
+    fn ensure_resource(
+        &mut self,
+        location: &str,
+        cache_for: Duration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(matched) = self.config.match_route(location) else {
+            return;
+        };
+        let Some(loader) = self.config.routes[matched.index].loader.clone() else {
+            return;
+        };
+        let key = normalize_location(location);
+        let now = cx.background_executor().now();
+        if self
+            .resources
+            .get(&key)
+            .is_some_and(|entry| entry.resource.is_fresh(now))
+        {
+            return;
+        }
+        self.next_resource_generation = self.next_resource_generation.wrapping_add(1);
+        let generation = self.next_resource_generation;
+        self.resources.insert(
+            key.clone(),
+            ResourceEntry {
+                generation,
+                resource: StoredResource::Loading,
+            },
+        );
+        let future = loader(matched.context, window, cx);
+        let task = cx.spawn(async move |this, cx| {
+            let result = future.await;
+            this.update(cx, |this, cx| {
+                let Some(entry) = this.resources.get_mut(&key) else {
+                    return;
+                };
+                if entry.generation != generation {
+                    return;
+                }
+                let expires_at = cx.background_executor().now() + cache_for;
+                entry.resource = match result {
+                    Ok(value) => StoredResource::Ready { value, expires_at },
+                    Err(error) => StoredResource::Error { error, expires_at },
+                };
+                cx.notify();
+            })
+            .ok();
+        });
+        task.detach();
+    }
+
+    fn resource_for(&self, location: &str) -> Option<StoredResource> {
+        self.resources
+            .get(&normalize_location(location))
+            .map(|entry| entry.resource.clone())
+    }
+
     /// Navigate using the router attached to `window`.
     ///
     /// Returns `false` when this window has no router. Returns `true` after
@@ -260,8 +426,15 @@ impl Render for Router {
                     self.replace(path, cx);
                 }
                 Some(GuardResult::Allow) | None => {
+                    let location = self.location().to_owned();
+                    self.ensure_resource(&location, DEFAULT_CACHE_FOR, window, cx);
+                    let Some(matched) = self.config.match_route(self.location()) else {
+                        return Empty.into_any_element();
+                    };
                     let route = &self.config.routes[matched.index];
-                    let context = matched.context;
+                    let context = matched
+                        .context
+                        .with_resource(self.resource_for(self.location()));
                     let mut current = (route.factory)(context.clone(), window, cx);
                     for layout in route.layouts.iter().rev() {
                         push_outlet(cx, current);
@@ -1145,6 +1318,421 @@ mod tests {
         router.update(cx, |router, cx| router.forward(cx));
 
         assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    async fn page_resource_is_loading_until_the_loader_resolves(cx: &mut TestAppContext) {
+        let captured = Arc::new(Mutex::new((false, None)));
+        let page_state = captured.clone();
+        let config = RouterConfig::new()
+            .route(
+                "/users/{id}",
+                move |user: crate::Resource<String, String>, _route: crate::RouteContext| {
+                    *page_state.lock().unwrap() = (user.is_loading(), user.get().cloned());
+                    "user"
+                },
+            )
+            .loader(|route: crate::RouteContext| {
+                let id = route.param("id").unwrap().to_owned();
+                async move { Ok::<String, String>(id) }
+            });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach_at(window, cx, config, "/users/42"),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        assert_eq!(*captured.lock().unwrap(), (true, None));
+
+        visual.run_until_parked();
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        assert_eq!(*captured.lock().unwrap(), (false, Some("42".to_owned())));
+    }
+
+    #[gpui::test]
+    async fn page_resource_exposes_loader_errors(cx: &mut TestAppContext) {
+        let captured = Arc::new(Mutex::new(None));
+        let page_state = captured.clone();
+        let config = RouterConfig::new()
+            .route(
+                "/users/{id}",
+                move |user: crate::Resource<String, String>| {
+                    *page_state.lock().unwrap() = user.error().cloned();
+                    "user"
+                },
+            )
+            .loader(|route: crate::RouteContext| {
+                let id = route.param("id").unwrap().to_owned();
+                async move { Err::<String, String>(format!("missing {id}")) }
+            });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach_at(window, cx, config, "/users/7"),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        visual.run_until_parked();
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+
+        assert_eq!(captured.lock().unwrap().as_deref(), Some("missing 7"));
+    }
+
+    #[gpui::test]
+    async fn prefetch_and_navigation_share_one_loader(cx: &mut TestAppContext) {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loader_loads = loads.clone();
+        let captured = Arc::new(Mutex::new(None));
+        let page_state = captured.clone();
+        let config = RouterConfig::new()
+            .route("/", || "home")
+            .route(
+                "/users/{id}",
+                move |user: crate::Resource<String, String>| {
+                    *page_state.lock().unwrap() = user.get().cloned();
+                    "user"
+                },
+            )
+            .loader(move |route: crate::RouteContext| {
+                loader_loads.fetch_add(1, Ordering::SeqCst);
+                let id = route.param("id").unwrap().to_owned();
+                async move { Ok::<String, String>(id) }
+            });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        visual.update(|window, cx| {
+            Router::prefetch_window(window, cx, "/users/42", None);
+        });
+        router.update(&mut visual, |router, cx| router.navigate("/users/42", cx));
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        visual.run_until_parked();
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert_eq!(captured.lock().unwrap().as_deref(), Some("42"));
+    }
+
+    #[gpui::test]
+    async fn visible_nav_link_prefetches_the_target_loader(cx: &mut TestAppContext) {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loader_loads = loads.clone();
+        let captured = Arc::new(Mutex::new(None));
+        let page_state = captured.clone();
+        let config = RouterConfig::new()
+            .route("/", || {
+                crate::NavLink::to("/users/42")
+                    .prefetch(crate::PrefetchWhen::Visible, None)
+                    .child("User 42")
+            })
+            .route(
+                "/users/{id}",
+                move |user: crate::Resource<String, String>| {
+                    *page_state.lock().unwrap() = user.get().cloned();
+                    "user"
+                },
+            )
+            .loader(move |route: crate::RouteContext| {
+                loader_loads.fetch_add(1, Ordering::SeqCst);
+                let id = route.param("id").unwrap().to_owned();
+                async move { Ok::<String, String>(id) }
+            });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        visual.run_until_parked();
+        router.update(&mut visual, |router, cx| router.navigate("/users/42", cx));
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert_eq!(captured.lock().unwrap().as_deref(), Some("42"));
+    }
+
+    #[gpui::test]
+    async fn resource_cache_expires_after_the_default_ttl(cx: &mut TestAppContext) {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loader_loads = loads.clone();
+        let config = RouterConfig::new()
+            .route("/users/{id}", |user: crate::Resource<String, String>| {
+                user.get().cloned().unwrap_or_default()
+            })
+            .loader(move |route: crate::RouteContext| {
+                loader_loads.fetch_add(1, Ordering::SeqCst);
+                let id = route.param("id").unwrap().to_owned();
+                async move { Ok::<String, String>(id) }
+            });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach_at(window, cx, config, "/users/42"),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        visual.run_until_parked();
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        cx.executor()
+            .advance_clock(DEFAULT_CACHE_FOR + Duration::from_secs(1));
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        visual.run_until_parked();
+
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
+
+    #[gpui::test]
+    async fn prefetch_sets_the_cache_ttl(cx: &mut TestAppContext) {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loader_loads = loads.clone();
+        let config = RouterConfig::new()
+            .route("/", || "home")
+            .route("/users/{id}", || "user")
+            .loader(move |route: crate::RouteContext| {
+                loader_loads.fetch_add(1, Ordering::SeqCst);
+                let id = route.param("id").unwrap().to_owned();
+                async move { Ok::<String, String>(id) }
+            });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        visual.update(|window, cx| {
+            Router::prefetch_window(window, cx, "/users/42", Duration::from_secs(1));
+        });
+        visual.run_until_parked();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        visual.update(|window, cx| {
+            Router::prefetch_window(window, cx, "/users/42", Duration::from_secs(1));
+        });
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        cx.executor().advance_clock(Duration::from_secs(1));
+        visual.update(|window, cx| {
+            Router::prefetch_window(window, cx, "/users/42", Duration::from_secs(1));
+        });
+        visual.run_until_parked();
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
+
+    #[gpui::test]
+    async fn nav_link_cache_for_expires_the_prefetch(cx: &mut TestAppContext) {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loader_loads = loads.clone();
+        let config = RouterConfig::new()
+            .route("/", || {
+                crate::NavLink::to("/users/42")
+                    .prefetch(crate::PrefetchWhen::Visible, Duration::from_secs(1))
+                    .child("User 42")
+            })
+            .route("/users/{id}", || "user")
+            .loader(move |_route: crate::RouteContext| {
+                loader_loads.fetch_add(1, Ordering::SeqCst);
+                async move { Ok::<String, String>("42".into()) }
+            });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        visual.run_until_parked();
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        cx.executor().advance_clock(Duration::from_secs(1));
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        visual.run_until_parked();
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
+
+    #[gpui::test]
+    async fn invalidate_path_reloads_that_resource(cx: &mut TestAppContext) {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loader_loads = loads.clone();
+        let config = RouterConfig::new().route("/users/{id}", || "user").loader(
+            move |route: crate::RouteContext| {
+                loader_loads.fetch_add(1, Ordering::SeqCst);
+                let id = route.param("id").unwrap().to_owned();
+                async move { Ok::<String, String>(id) }
+            },
+        );
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach_at(window, cx, config, "/users/42"),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        visual.run_until_parked();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        visual.update(|window, cx| {
+            Router::invalidate_window(window, cx, crate::Invalidate::path("/users/42"));
+        });
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        visual.run_until_parked();
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
+
+    #[gpui::test]
+    async fn invalidate_named_route_with_params_reloads_that_resource(cx: &mut TestAppContext) {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loader_loads = loads.clone();
+        let config = RouterConfig::new()
+            .route("/users/{id}", || "user")
+            .name("users.show")
+            .loader(move |route: crate::RouteContext| {
+                loader_loads.fetch_add(1, Ordering::SeqCst);
+                let id = route.param("id").unwrap().to_owned();
+                async move { Ok::<String, String>(id) }
+            });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach_at(window, cx, config, "/users/42"),
+        });
+        let router = router_for_window(&window, cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            Router::prefetch_window(window, cx, "/users/7", None);
+        });
+        visual.run_until_parked();
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+
+        visual.update(|window, cx| {
+            Router::invalidate_window(
+                window,
+                cx,
+                crate::Invalidate::named("users.show").param("id", "42"),
+            );
+        });
+        visual.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            router.clone()
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            Router::prefetch_window(window, cx, "/users/7", None);
+        });
+        assert_eq!(loads.load(Ordering::SeqCst), 3);
+    }
+
+    #[gpui::test]
+    async fn invalidate_named_route_without_params_reloads_all_matching_resources(
+        cx: &mut TestAppContext,
+    ) {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loader_loads = loads.clone();
+        let config = RouterConfig::new()
+            .route("/users/{id}", || "user")
+            .name("users.show")
+            .loader(move |route: crate::RouteContext| {
+                loader_loads.fetch_add(1, Ordering::SeqCst);
+                let id = route.param("id").unwrap().to_owned();
+                async move { Ok::<String, String>(id) }
+            });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        visual.update(|window, cx| {
+            Router::prefetch_window(window, cx, "/users/42", None);
+            Router::prefetch_window(window, cx, "/users/7", None);
+        });
+        visual.run_until_parked();
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+
+        visual.update(|window, cx| {
+            Router::invalidate_window(window, cx, crate::Invalidate::named("users.show"));
+            Router::prefetch_window(window, cx, "/users/42", None);
+            Router::prefetch_window(window, cx, "/users/7", None);
+        });
+        visual.run_until_parked();
+        assert_eq!(loads.load(Ordering::SeqCst), 4);
+    }
+
+    #[gpui::test]
+    async fn invalidate_all_reloads_all_resources(cx: &mut TestAppContext) {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let user_loads = loads.clone();
+        let post_loads = loads.clone();
+        let config = RouterConfig::new()
+            .route("/users/{id}", || "user")
+            .loader(move |route: crate::RouteContext| {
+                user_loads.fetch_add(1, Ordering::SeqCst);
+                let id = route.param("id").unwrap().to_owned();
+                async move { Ok::<String, String>(id) }
+            })
+            .route("/posts/{id}", || "post")
+            .loader(move |_route: crate::RouteContext| {
+                post_loads.fetch_add(1, Ordering::SeqCst);
+                async move { Ok::<String, String>("post".into()) }
+            });
+        let window = cx.add_window(|window, cx| Root {
+            router: Router::attach(window, cx, config),
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        visual.update(|window, cx| {
+            Router::prefetch_window(window, cx, "/users/42", None);
+            Router::prefetch_window(window, cx, "/posts/1", None);
+        });
+        visual.run_until_parked();
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+
+        visual.update(|window, cx| {
+            Router::invalidate_window(window, cx, crate::Invalidate::all());
+            Router::prefetch_window(window, cx, "/users/42", None);
+            Router::prefetch_window(window, cx, "/posts/1", None);
+        });
+        visual.run_until_parked();
+        assert_eq!(loads.load(Ordering::SeqCst), 4);
     }
 
     #[gpui::test]

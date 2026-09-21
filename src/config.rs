@@ -1,5 +1,7 @@
+use crate::LoaderFactory;
+use crate::resource::{Resource, RouteLoader, StoredResource, erase_loader};
 use gpui::{AnyElement, App, IntoElement, Window};
-use std::{fmt, ops::Range, rc::Rc};
+use std::{fmt, marker::PhantomData, ops::Range, rc::Rc};
 
 pub(crate) type RouteFactory = Box<dyn Fn(RouteContext, &mut Window, &mut App) -> AnyElement>;
 pub(crate) type LayoutFactory = Rc<dyn Fn(RouteContext, &mut Window, &mut App) -> AnyElement>;
@@ -126,6 +128,12 @@ pub struct WithAppContext;
 pub struct WithRoute;
 #[doc(hidden)]
 pub struct WithRouteContext;
+#[doc(hidden)]
+pub struct WithResource<T, E>(PhantomData<(T, E)>);
+#[doc(hidden)]
+pub struct WithResourceRoute<T, E>(PhantomData<(T, E)>);
+#[doc(hidden)]
+pub struct WithResourceRouteContext<T, E>(PhantomData<(T, E)>);
 
 pub trait PageFactory<Kind>: 'static {
     #[doc(hidden)]
@@ -172,6 +180,44 @@ where
     }
 }
 
+impl<F, El, T, Err> PageFactory<WithResource<T, Err>> for F
+where
+    F: Fn(Resource<T, Err>) -> El + 'static,
+    El: IntoElement,
+    T: Send + Sync + 'static,
+    Err: Send + Sync + 'static,
+{
+    fn render(&self, route: RouteContext, _window: &mut Window, _cx: &mut App) -> AnyElement {
+        self(route.resource()).into_any_element()
+    }
+}
+
+impl<F, El, T, Err> PageFactory<WithResourceRoute<T, Err>> for F
+where
+    F: Fn(Resource<T, Err>, RouteContext) -> El + 'static,
+    El: IntoElement,
+    T: Send + Sync + 'static,
+    Err: Send + Sync + 'static,
+{
+    fn render(&self, route: RouteContext, _window: &mut Window, _cx: &mut App) -> AnyElement {
+        let resource = route.resource();
+        self(resource, route).into_any_element()
+    }
+}
+
+impl<F, El, T, Err> PageFactory<WithResourceRouteContext<T, Err>> for F
+where
+    F: Fn(Resource<T, Err>, RouteContext, &mut Window, &mut App) -> El + 'static,
+    El: IntoElement,
+    T: Send + Sync + 'static,
+    Err: Send + Sync + 'static,
+{
+    fn render(&self, route: RouteContext, window: &mut Window, cx: &mut App) -> AnyElement {
+        let resource = route.resource();
+        self(resource, route, window, cx).into_any_element()
+    }
+}
+
 pub trait GuardFactory<Kind>: 'static {
     #[doc(hidden)]
     fn run(&self, route: RouteContext, window: &mut Window, cx: &mut App) -> GuardResult;
@@ -213,16 +259,52 @@ where
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct RouteContext {
     path: String,
     params: Vec<(String, String)>,
     query: Vec<(String, String)>,
+    resource: Option<StoredResource>,
+}
+
+impl PartialEq for RouteContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.params == other.params && self.query == other.query
+    }
+}
+
+impl Eq for RouteContext {}
+
+impl fmt::Debug for RouteContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RouteContext")
+            .field("path", &self.path)
+            .field("params", &self.params)
+            .field("query", &self.query)
+            .finish()
+    }
 }
 
 impl RouteContext {
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    pub fn resource<T, E>(&self) -> Resource<T, E>
+    where
+        T: Send + Sync + 'static,
+        E: Send + Sync + 'static,
+    {
+        self.resource
+            .as_ref()
+            .map(StoredResource::downcast)
+            .unwrap_or_else(Resource::loading)
+    }
+
+    pub(crate) fn with_resource(mut self, resource: Option<StoredResource>) -> Self {
+        self.resource = resource;
+        self
     }
 
     pub fn param(&self, name: &str) -> Option<&str> {
@@ -260,6 +342,7 @@ pub(crate) struct RouteEntry {
     pub(crate) factory: RouteFactory,
     pub(crate) guards: Vec<RouteGuard>,
     pub(crate) layouts: Vec<LayoutFactory>,
+    pub(crate) loader: Option<RouteLoader>,
     name: Option<String>,
     constraints: Vec<CompiledParamConstraint>,
     matchers: Vec<RouteMatcher>,
@@ -403,6 +486,7 @@ impl RouterConfig {
                 route.factory,
                 route.guards,
                 route.layouts,
+                route.loader,
                 route.constraints,
                 route.name,
             );
@@ -443,6 +527,32 @@ impl RouterConfig {
                 }
             }
             None => panic!("a guard must follow a route or group"),
+        }
+        self
+    }
+
+    /// Attach an async loader to the previous route.
+    ///
+    /// The loader runs when the route is rendered or prefetched. It does not
+    /// block navigation. The matched page receives a [`Resource`] with
+    /// `is_loading` / `has_error` / `get` / `error`.
+    ///
+    /// Panics if the previous registration was not a single route.
+    pub fn loader<L, Kind, T, E>(mut self, loader: L) -> Self
+    where
+        L: LoaderFactory<Kind, T, E>,
+        T: Send + Sync + 'static,
+        E: Send + Sync + 'static,
+    {
+        let loader = erase_loader(loader);
+        match self.last_registration.as_ref() {
+            Some(LastRegistration::Route(index)) => {
+                self.routes[*index].loader = Some(loader);
+            }
+            Some(LastRegistration::Group(_)) => {
+                panic!("a loader must follow a route");
+            }
+            None => panic!("a loader must follow a route"),
         }
         self
     }
@@ -551,6 +661,7 @@ impl RouterConfig {
             factory,
             Vec::new(),
             self.layouts.clone(),
+            None,
             Vec::new(),
             None,
         );
@@ -564,6 +675,7 @@ impl RouterConfig {
         factory: RouteFactory,
         guards: Vec<RouteGuard>,
         layouts: Vec<LayoutFactory>,
+        loader: Option<RouteLoader>,
         constraints: Vec<CompiledParamConstraint>,
         name: Option<String>,
     ) {
@@ -614,6 +726,7 @@ impl RouterConfig {
             factory,
             guards,
             layouts,
+            loader,
             name: None,
             constraints,
             matchers,
@@ -623,6 +736,12 @@ impl RouterConfig {
         if let Some(name) = name {
             self.assign_name(index, name);
         }
+    }
+
+    pub(crate) fn named_route_index(&self, name: &str) -> Option<usize> {
+        self.routes
+            .iter()
+            .position(|route| route.name.as_deref() == Some(name))
     }
 
     pub(crate) fn match_route(&self, location: &str) -> Option<MatchedRoute> {
@@ -682,6 +801,7 @@ fn matched_route(
                 path: path.to_owned(),
                 params,
                 query: query.to_vec(),
+                resource: None,
             },
         });
     }
@@ -1441,6 +1561,23 @@ mod tests {
 
         assert_eq!(config.routes[0].guards.len(), 1);
         assert!(config.routes[1].guards.is_empty());
+    }
+
+    #[test]
+    fn attaches_a_loader_to_the_previous_route() {
+        let config = RouterConfig::new()
+            .route("/", || "home")
+            .loader(|| async { Ok::<_, String>("ok".to_owned()) })
+            .route("/about", || "about");
+
+        assert!(config.routes[0].loader.is_some());
+        assert!(config.routes[1].loader.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "a loader must follow a route")]
+    fn rejects_a_loader_without_a_previous_route() {
+        let _ = RouterConfig::new().loader(|| async { Ok::<_, String>("ok".to_owned()) });
     }
 
     #[test]
