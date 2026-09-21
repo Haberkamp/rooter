@@ -9,6 +9,8 @@ version.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-21
+
 ### Added
 
 - Route loaders, `Resource` loading state, prefetch (default 30s TTL), and
