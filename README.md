@@ -46,12 +46,14 @@ See `examples/simple.rs` for a complete application and
 `examples/nested.rs` demonstrates recursive groups, group index routes,
 dynamic segments, and scoped catch-alls.
 `examples/layouts.rs` demonstrates nested layouts, `Outlet`, and stateful chrome.
+`examples/prefetch.rs` demonstrates route loaders, a 2s artificial delay, and hover prefetch.
 
 ```sh
 cargo run --example simple
 cargo run --example multi_file
 cargo run --example nested
 cargo run --example layouts
+cargo run --example prefetch
 ```
 
 ## Compatibility
@@ -121,6 +123,61 @@ fn dashboard(sidebar: Entity<Sidebar>) -> impl IntoElement {
 The layout still rebuilds each frame. The `Sidebar` entity does not, so its
 fields survive leaving `/dashboard` and coming back. Creating that entity
 inside the layout factory would reset it on every render.
+
+## Route data
+
+`.loader()` starts an async task for the previous route. The page receives a
+`Resource` (`is_loading`, `has_error`, `get`, `error`). Navigation does not wait
+for the loader. Hover or first paint on `NavLink`, or `Router::prefetch_window`,
+run the same task so a later visit can reuse it. Cached results expire after
+30 seconds by default (`DEFAULT_CACHE_FOR`). Set the TTL on the link or prefetch
+call, not on the route.
+
+```rust
+fn load(route: RouteContext) -> impl Future<Output = Result<User, String>> {
+    let id = route.param("id").unwrap().to_owned();
+    async move { fetch_user(&id).await }
+}
+
+fn page(user: Resource<User, String>, route: RouteContext) -> impl IntoElement {
+    if user.is_loading() {
+        return div().child("Loading…");
+    }
+    if let Some(error) = user.error() {
+        return div().child(error.clone());
+    }
+    div().child(user.get().unwrap().name.clone())
+}
+
+RouterConfig::new()
+    .route("/users/{id}", page)
+    .loader(load);
+
+NavLink::to("/users/42")
+    .prefetch(PrefetchWhen::Hover, None)
+    .child("User 42");
+
+NavLink::to("/users/7")
+    .prefetch(PrefetchWhen::Hover, Duration::from_secs(5))
+    .child("User 7");
+
+Router::prefetch_window(window, cx, "/users/42", None);
+Router::prefetch_window(window, cx, "/users/42", Duration::from_secs(60));
+
+Router::invalidate_window(window, cx, Invalidate::path("/users/42"));
+Router::invalidate_window(
+    window,
+    cx,
+    Invalidate::named("users.show").param("id", "42"),
+);
+Router::invalidate_window(window, cx, Invalidate::named("users.show"));
+Router::invalidate_window(window, cx, Invalidate::all());
+```
+
+Keep `load` next to `page` in the same module. The loader must return
+`Result<T, E>` where both types are `Send + Sync`.
+
+See `examples/prefetch.rs` for a complete window with a 2 second delay.
 
 ## Development
 

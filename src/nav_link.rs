@@ -1,11 +1,26 @@
-use crate::{Router, config::location_path};
+use crate::{Router, config::location_path, resource::IntoCacheFor};
 use gpui::{
     AnyElement, App, Div, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce,
     SharedString, Stateful, StatefulInteractiveElement, Window, div,
 };
 use std::marker::PhantomData;
+use std::time::Duration;
 
 type ActiveStyle = Box<dyn FnOnce(Stateful<Div>) -> Stateful<Div>>;
+
+/// When a [`NavLink`] starts the target route's loader.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PrefetchWhen {
+    #[default]
+    Hover,
+    Visible,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Prefetch {
+    when: PrefetchWhen,
+    cache_for: Duration,
+}
 
 /// How a [`NavLink`] compares the current location to its target.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -40,6 +55,7 @@ pub struct NavLink<Target: 'static = PathTarget> {
     children: Vec<AnyElement>,
     match_mode: ActiveMatch,
     when_active: Option<ActiveStyle>,
+    prefetch: Option<Prefetch>,
     _target: PhantomData<Target>,
 }
 
@@ -50,6 +66,7 @@ impl NavLink<PathTarget> {
             children: Vec::new(),
             match_mode: ActiveMatch::Exact,
             when_active: None,
+            prefetch: None,
             _target: PhantomData,
         }
     }
@@ -63,6 +80,7 @@ impl NavLink<PathTarget> {
             children: Vec::new(),
             match_mode: ActiveMatch::Exact,
             when_active: None,
+            prefetch: None,
             _target: PhantomData,
         }
     }
@@ -87,6 +105,17 @@ impl<Target> NavLink<Target> {
         self.when_active = Some(Box::new(style));
         self
     }
+
+    /// Start the target route loader early.
+    ///
+    /// `cache_for` is a [`Duration`] or [`None`] ([`crate::DEFAULT_CACHE_FOR`]).
+    pub fn prefetch(mut self, when: PrefetchWhen, cache_for: impl IntoCacheFor) -> Self {
+        self.prefetch = Some(Prefetch {
+            when,
+            cache_for: cache_for.into_cache_for(),
+        });
+        self
+    }
 }
 
 impl<Target> ParentElement for NavLink<Target> {
@@ -103,12 +132,36 @@ impl<Target: 'static> RenderOnce for NavLink<Target> {
         let active = Router::window_location(window, cx).is_some_and(|location| {
             location_matches(location.as_ref(), to.as_ref(), self.match_mode)
         });
+        let prefetch = self.prefetch;
         let mut link = div()
             .id(ElementId::from(to.clone()))
-            .on_click(move |_, window, cx| {
-                Router::navigate_window(window, cx, to.clone());
+            .on_click({
+                let to = to.clone();
+                move |_, window, cx| {
+                    Router::navigate_window(window, cx, to.clone());
+                }
             })
             .children(self.children);
+        match prefetch {
+            Some(Prefetch {
+                when: PrefetchWhen::Hover,
+                cache_for,
+            }) => {
+                let to = to.clone();
+                link = link.on_hover(move |hovered, window, cx| {
+                    if *hovered {
+                        Router::prefetch_window(window, cx, to.clone(), cache_for);
+                    }
+                });
+            }
+            Some(Prefetch {
+                when: PrefetchWhen::Visible,
+                cache_for,
+            }) => {
+                Router::prefetch_window(window, cx, to.clone(), cache_for);
+            }
+            None => {}
+        }
         if active && let Some(when_active) = self.when_active {
             link = when_active(link);
         }
